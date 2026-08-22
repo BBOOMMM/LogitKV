@@ -35,6 +35,7 @@ from kvpress import (
     DuoAttentionPress,
     ExpectedAttentionPress,
     KnormPress,
+    LogitKVPress,
     ObservedAttentionPress,
     RandomPress,
     SnapKVPress,
@@ -71,6 +72,7 @@ SCORER_DICT = {
 }
 
 PRESS_DICT = {
+    "logitkv": LogitKVPress(SnapKVPress()),
     "criti_adasnapkv": CriticalAdaKVPress(SnapKVPress()),
     "criti_ada_expected_attention": CriticalAdaKVPress(ExpectedAttentionPress(use_vnorm=False)),
     "criti_snapkv": CriticalKVPress(SnapKVPress()),
