@@ -49,6 +49,40 @@ def test_fisher_rms_matches_explicit_vwo_reference_with_gqa():
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
 
 
+def test_multiple_fisher_samples_average_quadratics_before_root():
+    press = LogitKVPress(
+        SnapKVPress(compression_ratio=0.5),
+        fisher_window=4,
+        fisher_samples=2,
+        fisher_eps=1e-12,
+        sanity_check=False,
+    )
+    base_scores = torch.tensor([[[2.0, 3.0]]])
+    press._states[0] = SimpleNamespace(
+        values=torch.empty(1, 1, 2, 1),
+        module=SimpleNamespace(layer_idx=0),
+        base_scores=base_scores,
+    )
+    press._total_length = 2
+    press._profile_values = {"score_seconds": 0.0}
+    first_quadratic = torch.tensor([[[1.0, 9.0]]])
+    second_quadratic = torch.tensor([[[9.0, 1.0]]])
+    expected_quadratic = (first_quadratic + second_quadratic) / 2
+    hook = press._make_gradient_hook(0)
+
+    with patch(
+        "kvpress.presses.logitkv_press.fisher_quadratic_sensitivity",
+        side_effect=[first_quadratic, second_quadratic],
+    ):
+        hook(torch.zeros(1, press.fisher_window, 1))
+        assert 0 not in press._scores
+        hook(torch.zeros(1, press.fisher_window, 1))
+
+    expected_scores = base_scores * torch.sqrt(expected_quadratic + press.fisher_eps)
+    torch.testing.assert_close(press._scores[0], expected_scores)
+    assert press._gradient_counts[0] == press.fisher_samples
+
+
 def test_root_and_squared_scores_have_identical_topk_ranking():
     torch.manual_seed(1)
     attention_scores = torch.rand(2, 3, 19) + 0.01
@@ -252,6 +286,7 @@ def test_128_token_prefill_and_compressed_cache_decode_on_cpu():
     press = LogitKVPress(
         SnapKVPress(compression_ratio=0.5, window_size=32, kernel_size=5),
         fisher_window=32,
+        fisher_samples=3,
         first_stage_ratio=0.5,
         fisher_seed=0,
     )
@@ -273,11 +308,12 @@ def test_128_token_prefill_and_compressed_cache_decode_on_cpu():
             with torch.autograd.graph.saved_tensors_hooks(record_saved_tensor, lambda tensor: tensor):
                 outputs = press.prefill(model, input_ids, cache)
 
-    assert outputs.logits.shape == (1, 1, config.vocab_size)
-    assert fisher_backward.call_count == 1
+    assert outputs.logits.shape == (1, press.fisher_samples, config.vocab_size)
+    assert fisher_backward.call_count == press.fisher_samples
     assert all(parameter.requires_grad for parameter in model.parameters())
     assert all(parameter.grad is None for parameter in model.parameters())
-    assert press.last_sampled_token_ids.shape == (1, 1)
+    assert press.last_sampled_token_ids.shape == (1, press.fisher_samples)
+    sampled_token_ids = press.last_sampled_token_ids.clone()
     assert press.last_ranking_check_passed is True
     assert press.last_full_cache_length == 128
     assert (1, 128, config.intermediate_size) not in saved_activation_shapes
@@ -291,6 +327,7 @@ def test_128_token_prefill_and_compressed_cache_decode_on_cpu():
         "compression_seconds",
         "total_seconds",
     }
+    assert press.last_profile["fisher_samples"] == press.fisher_samples
     for layer in cache.layers:
         assert layer.keys.shape == (1, config.num_key_value_heads, 64, config.head_dim)
         assert layer.values.shape == (1, config.num_key_value_heads, 64, config.head_dim)
@@ -301,6 +338,7 @@ def test_128_token_prefill_and_compressed_cache_decode_on_cpu():
     with torch.inference_mode():
         repeated_cache = DynamicCache()
         press.prefill(model, input_ids, repeated_cache)
+    torch.testing.assert_close(press.last_sampled_token_ids, sampled_token_ids)
     for expected_keys, repeated_layer in zip(selected_keys, repeated_cache.layers):
         torch.testing.assert_close(repeated_layer.keys, expected_keys)
 

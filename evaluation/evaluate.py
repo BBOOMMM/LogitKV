@@ -107,6 +107,7 @@ def evaluate(
     press_name: str = "efficient_ada_denfensive",
     compression_ratio: float = 0.75,
     fisher_window: int = 32,
+    fisher_samples: int = 1,
     fisher_seed: int = 42,
     fraction: float = 0.2,
     max_new_tokens: Optional[int] = None,
@@ -132,8 +133,10 @@ def evaluate(
         Compression ratio for the press, by default 0.1
     fisher_window : int, optional
         Number of trailing differentiable tokens used by LogitKV, by default 32
+    fisher_samples : int, optional
+        Number of trailing logit positions independently sampled for LogitKV Fisher averaging, by default 1
     fisher_seed : int, optional
-        Sampling seed for LogitKV's one-sample Fisher probe, by default 42
+        Sampling seed for LogitKV's Fisher probes, by default 42
     max_new_tokens : int, optional
         Maximum number of new tokens to generate, by default use the default for the task (recommended)
     fraction : float, optional
@@ -156,7 +159,9 @@ def evaluate(
             press.compression_ratio = compression_ratio  # type:ignore[attr-definedif press is not None
         if isinstance(press, LogitKVPress):
             assert fisher_window > 0, "fisher_window must be positive"
+            assert 0 < fisher_samples <= fisher_window, "fisher_samples must be in [1, fisher_window]"
             press.fisher_window = fisher_window
+            press.fisher_samples = fisher_samples
             press.fisher_seed = fisher_seed
     else:
         press = None
@@ -173,7 +178,7 @@ def evaluate(
         f"cr{compression_ratio:g}",
     ]
     if isinstance(press, LogitKVPress):
-        filename_parts.extend([f"fw{fisher_window}", f"fs{fisher_seed}"])
+        filename_parts.extend([f"fw{fisher_window}", f"samples{fisher_samples}", f"fs{fisher_seed}"])
     filename_parts.append(f"frac{fraction:.2f}")
     if max_context_length is not None:
         filename_parts.append(f"max_context{max_context_length}")

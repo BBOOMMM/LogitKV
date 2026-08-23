@@ -219,6 +219,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate model efficiency with different press methods.")
     parser.add_argument("--model_path", type=str, required=True, help="Path to the model.")
     parser.add_argument("--press_name", type=str, required=True, choices=PRESS_DICT.keys(), help="Name of the press method to use.")
+    parser.add_argument("--fisher_window", type=int, default=32, help="LogitKV differentiable trailing window.")
+    parser.add_argument("--fisher_samples", type=int, default=1, help="LogitKV trailing Fisher probe positions.")
+    parser.add_argument("--fisher_seed", type=int, default=42, help="LogitKV Fisher sampling seed.")
     args = parser.parse_args()
 
     model_path = args.model_path
@@ -229,6 +232,12 @@ if __name__ == "__main__":
 
 
     press = PRESS_DICT[press_name]
+    if isinstance(press, LogitKVPress):
+        if not 0 < args.fisher_samples <= args.fisher_window:
+            parser.error("--fisher_samples must be in [1, --fisher_window]")
+        press.fisher_window = args.fisher_window
+        press.fisher_samples = args.fisher_samples
+        press.fisher_seed = args.fisher_seed
 
     model_kwargs = {"attn_implementation": "flash_attention_2"}
     if isinstance(press, ObservedAttentionPress):

@@ -191,13 +191,15 @@ class LogitKVPress(BasePress):
     """Memory-efficient online LogitKV with downstream Fisher sensitivity.
 
     The context is split into a detached no-grad prefix and a differentiable
-    trailing Fisher window. Each attention-output gradient hook immediately
-    computes its layer's LogitKV score, after which the full cache is compressed
-    with CriticalKV's Stage-1 safeguard and per-head Top-K rule.
+    trailing Fisher window. Independent probes from the trailing logit positions
+    accumulate per-layer Fisher quadratic forms, which are averaged before the
+    square root. The full cache is then compressed with CriticalKV's Stage-1
+    safeguard and per-head Top-K rule.
     """
 
     press: ScorerPress
     fisher_window: int = 32
+    fisher_samples: int = 1
     first_stage_ratio: float = 0.5
     fisher_eps: float = 1e-12
     sanity_check: bool = True
@@ -205,6 +207,8 @@ class LogitKVPress(BasePress):
     profile: bool = False
 
     _states: dict[int, _LayerState] = field(default_factory=dict, init=False, repr=False)
+    _quadratic_sums: dict[int, torch.Tensor] = field(default_factory=dict, init=False, repr=False)
+    _gradient_counts: dict[int, int] = field(default_factory=dict, init=False, repr=False)
     _scores: dict[int, torch.Tensor] = field(default_factory=dict, init=False, repr=False)
     _active: bool = field(default=False, init=False, repr=False)
     _total_length: int = field(default=0, init=False, repr=False)
@@ -220,6 +224,10 @@ class LogitKVPress(BasePress):
             raise TypeError("LogitKVPress requires a ScorerPress as input")
         if self.fisher_window <= 0:
             raise ValueError("fisher_window must be positive")
+        if self.fisher_samples <= 0:
+            raise ValueError("fisher_samples must be positive")
+        if self.fisher_samples > self.fisher_window:
+            raise ValueError("fisher_samples must not exceed fisher_window")
         if not 0 <= self.first_stage_ratio <= 1:
             raise ValueError("first_stage_ratio must be between 0 and 1")
         if self.fisher_eps < 0:
@@ -330,24 +338,38 @@ class LogitKVPress(BasePress):
             return output[0]
         raise RuntimeError("LogitKV could not find final logits in the model output")
 
-    def _sample_log_probability(self, logits: torch.Tensor) -> torch.Tensor:
-        final_logits = logits[:, -1, :].float()
-        if not final_logits.requires_grad:
+    def _sample_log_probabilities(self, logits: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """Sample one Fisher label at each of the trailing probe positions."""
+
+        if logits.shape[1] < self.fisher_samples:
+            raise ValueError(
+                f"Need {self.fisher_samples} trailing logits for Fisher probes, got {logits.shape[1]}"
+            )
+        probe_logits = logits[:, -self.fisher_samples :, :].float()
+        if not probe_logits.requires_grad:
             raise RuntimeError(
-                "Final logits do not require gradients. Run LogitKV inside its context manager "
+                "Fisher probe logits do not require gradients. Run LogitKV inside its context manager "
                 "and do not wrap the model call in an un-overridable inference context."
             )
-        probabilities = torch.softmax(final_logits.detach(), dim=-1)
+        probabilities = torch.softmax(probe_logits.detach(), dim=-1)
         if not torch.isfinite(probabilities).all():
-            raise FloatingPointError("Final-token probabilities contain non-finite values")
+            raise FloatingPointError("Fisher probe probabilities contain non-finite values")
 
         generator = None
         if self.fisher_seed is not None:
             generator = torch.Generator(device=probabilities.device)
             generator.manual_seed(self.fisher_seed)
-        sampled = torch.multinomial(probabilities, num_samples=1, generator=generator)
+        batch_size, num_positions, vocab_size = probabilities.shape
+        sampled = torch.multinomial(
+            probabilities.reshape(batch_size * num_positions, vocab_size),
+            num_samples=1,
+            generator=generator,
+        ).reshape(batch_size, num_positions)
         self.last_sampled_token_ids = sampled.detach().cpu()
-        return torch.log_softmax(final_logits, dim=-1).gather(-1, sampled).mean()
+        sampled_log_probabilities = torch.log_softmax(probe_logits, dim=-1).gather(
+            -1, sampled.unsqueeze(-1)
+        ).squeeze(-1)
+        return tuple(sampled_log_probabilities[:, sample_idx].mean() for sample_idx in range(num_positions))
 
     @staticmethod
     def _normal_tensor(tensor: torch.Tensor | None) -> torch.Tensor | None:
@@ -382,26 +404,44 @@ class LogitKVPress(BasePress):
                     module=state.module,
                     fisher_window=self.fisher_window,
                 )
-                fisher_rms = torch.sqrt(fisher_quadratic.clamp_min(0.0) + self.fisher_eps)
-                scores = state.base_scores * fisher_rms
-                if not torch.isfinite(scores).all():
-                    raise FloatingPointError(f"LogitKV produced non-finite scores at layer {layer_idx}")
+                if layer_idx not in self._quadratic_sums:
+                    self._quadratic_sums[layer_idx] = fisher_quadratic
+                    self._gradient_counts[layer_idx] = 1
+                else:
+                    self._quadratic_sums[layer_idx].add_(fisher_quadratic)
+                    self._gradient_counts[layer_idx] += 1
 
-                n_kept = int(self._total_length * (1 - self.compression_ratio))
-                if self.sanity_check:
-                    layer_ranking_check_passed = assert_root_squared_ranking(
-                        state.base_scores,
-                        fisher_quadratic,
-                        n_kept,
-                        self.fisher_eps,
-                        score_root=scores,
-                        layer_idx=layer_idx,
+                gradient_count = self._gradient_counts[layer_idx]
+                if gradient_count > self.fisher_samples:
+                    raise RuntimeError(
+                        f"Layer {layer_idx} received {gradient_count} Fisher gradients; "
+                        f"expected {self.fisher_samples}"
                     )
-                    if self.last_ranking_check_passed is None:
-                        self.last_ranking_check_passed = layer_ranking_check_passed
-                    else:
-                        self.last_ranking_check_passed &= layer_ranking_check_passed
-                self._scores[layer_idx] = scores.detach()
+
+                # Fisher matrices (and therefore their quadratic forms) are
+                # averaged before applying the square root.
+                if gradient_count == self.fisher_samples:
+                    fisher_quadratic_mean = self._quadratic_sums[layer_idx] / self.fisher_samples
+                    fisher_rms = torch.sqrt(fisher_quadratic_mean.clamp_min(0.0) + self.fisher_eps)
+                    scores = state.base_scores * fisher_rms
+                    if not torch.isfinite(scores).all():
+                        raise FloatingPointError(f"LogitKV produced non-finite scores at layer {layer_idx}")
+
+                    n_kept = int(self._total_length * (1 - self.compression_ratio))
+                    if self.sanity_check:
+                        layer_ranking_check_passed = assert_root_squared_ranking(
+                            state.base_scores,
+                            fisher_quadratic_mean,
+                            n_kept,
+                            self.fisher_eps,
+                            score_root=scores,
+                            layer_idx=layer_idx,
+                        )
+                        if self.last_ranking_check_passed is None:
+                            self.last_ranking_check_passed = layer_ranking_check_passed
+                        else:
+                            self.last_ranking_check_passed &= layer_ranking_check_passed
+                    self._scores[layer_idx] = scores.detach()
 
             self._sync_for_profile(output_grad.device)
             self._profile_values["score_seconds"] += time.perf_counter() - started_at
@@ -410,6 +450,15 @@ class LogitKVPress(BasePress):
         return gradient_hook
 
     def _compress_cache_from_scores(self) -> None:
+        incomplete = {
+            layer_idx: self._gradient_counts.get(layer_idx, 0)
+            for layer_idx in self._states
+            if self._gradient_counts.get(layer_idx, 0) != self.fisher_samples
+        }
+        if incomplete:
+            raise RuntimeError(
+                f"LogitKV received incomplete Fisher gradients {incomplete}; expected {self.fisher_samples} per layer"
+            )
         if self._states.keys() != self._scores.keys():
             missing = sorted(self._states.keys() - self._scores.keys())
             raise RuntimeError(f"LogitKV did not receive gradients for layers {missing}")
@@ -464,6 +513,10 @@ class LogitKVPress(BasePress):
             raise NotImplementedError("LogitKV currently supports non-quantized DynamicCache only")
         if cache.get_seq_length() != 0:
             raise ValueError("LogitKV prefill requires an empty DynamicCache")
+        if self.fisher_samples <= 0:
+            raise ValueError("fisher_samples must be positive")
+        if self.fisher_samples > self.fisher_window:
+            raise ValueError("fisher_samples must not exceed fisher_window")
 
         input_ids = self._normal_tensor(input_ids)
         attention_mask = self._normal_tensor(attention_mask)
@@ -485,6 +538,8 @@ class LogitKVPress(BasePress):
         forward_hooks = []
         device = input_ids.device
         self._states.clear()
+        self._quadratic_sums.clear()
+        self._gradient_counts.clear()
         self._scores.clear()
         self._gradient_handles.clear()
         self._profile_values = {"score_seconds": 0.0}
@@ -541,7 +596,7 @@ class LogitKVPress(BasePress):
                         past_key_values=cache,
                         output_attentions=output_attentions,
                         use_cache=True,
-                        logits_to_keep=1,
+                        logits_to_keep=self.fisher_samples,
                     )
                 self._sync_for_profile(device)
                 self._profile_values["suffix_forward_seconds"] = time.perf_counter() - phase_started_at
@@ -554,13 +609,14 @@ class LogitKVPress(BasePress):
                         f"LogitKV captured {len(self._states)} of {len(model.model.layers)} attention layers"
                     )
 
-                probe = self._sample_log_probability(self._logits_from_output(outputs))
+                probes = self._sample_log_probabilities(self._logits_from_output(outputs))
                 self._sync_for_profile(device)
                 phase_started_at = time.perf_counter()
-                probe.backward()
+                for sample_idx, probe in enumerate(probes):
+                    probe.backward(retain_graph=sample_idx < self.fisher_samples - 1)
+                    suffix_embeds.grad = None
                 self._sync_for_profile(device)
                 self._profile_values["backward_with_score_seconds"] = time.perf_counter() - phase_started_at
-                suffix_embeds.grad = None
 
                 phase_started_at = time.perf_counter()
                 self._compress_cache_from_scores()
@@ -575,6 +631,7 @@ class LogitKVPress(BasePress):
             )
             self.last_profile = {
                 **self._profile_values,
+                "fisher_samples": self.fisher_samples,
                 "total_seconds": time.perf_counter() - total_started_at,
             }
             if self.profile and device.type == "cuda":
@@ -588,6 +645,8 @@ class LogitKVPress(BasePress):
             for parameter, requires_grad in zip(parameters, parameter_requires_grad):
                 parameter.requires_grad_(requires_grad)
             self._states.clear()
+            self._quadratic_sums.clear()
+            self._gradient_counts.clear()
             self._scores.clear()
             self._gradient_handles.clear()
             self._active = False
