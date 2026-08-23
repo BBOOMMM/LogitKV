@@ -49,15 +49,17 @@ def test_fisher_rms_matches_explicit_vwo_reference_with_gqa():
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
 
 
-def test_multiple_fisher_samples_average_quadratics_before_root():
+def test_multiple_fisher_labels_average_quadratics_before_root():
     press = LogitKVPress(
         SnapKVPress(compression_ratio=0.5),
         fisher_window=4,
-        fisher_samples=2,
+        fisher_positions=1,
+        fisher_labels=2,
+        attention_eps=0.25,
         fisher_eps=1e-12,
         sanity_check=False,
     )
-    base_scores = torch.tensor([[[2.0, 3.0]]])
+    base_scores = torch.tensor([[[0.0, 3.0]]])
     press._states[0] = SimpleNamespace(
         values=torch.empty(1, 1, 2, 1),
         module=SimpleNamespace(layer_idx=0),
@@ -78,9 +80,9 @@ def test_multiple_fisher_samples_average_quadratics_before_root():
         assert 0 not in press._scores
         hook(torch.zeros(1, press.fisher_window, 1))
 
-    expected_scores = base_scores * torch.sqrt(expected_quadratic + press.fisher_eps)
+    expected_scores = (base_scores + press.attention_eps) * torch.sqrt(expected_quadratic + press.fisher_eps)
     torch.testing.assert_close(press._scores[0], expected_scores)
-    assert press._gradient_counts[0] == press.fisher_samples
+    assert press._gradient_counts[0] == press._fisher_probe_count
 
 
 def test_root_and_squared_scores_have_identical_topk_ranking():
@@ -286,7 +288,8 @@ def test_128_token_prefill_and_compressed_cache_decode_on_cpu():
     press = LogitKVPress(
         SnapKVPress(compression_ratio=0.5, window_size=32, kernel_size=5),
         fisher_window=32,
-        fisher_samples=3,
+        fisher_positions=3,
+        fisher_labels=2,
         first_stage_ratio=0.5,
         fisher_seed=0,
     )
@@ -308,11 +311,11 @@ def test_128_token_prefill_and_compressed_cache_decode_on_cpu():
             with torch.autograd.graph.saved_tensors_hooks(record_saved_tensor, lambda tensor: tensor):
                 outputs = press.prefill(model, input_ids, cache)
 
-    assert outputs.logits.shape == (1, press.fisher_samples, config.vocab_size)
-    assert fisher_backward.call_count == press.fisher_samples
+    assert outputs.logits.shape == (1, press.fisher_positions, config.vocab_size)
+    assert fisher_backward.call_count == press._fisher_probe_count
     assert all(parameter.requires_grad for parameter in model.parameters())
     assert all(parameter.grad is None for parameter in model.parameters())
-    assert press.last_sampled_token_ids.shape == (1, press.fisher_samples)
+    assert press.last_sampled_token_ids.shape == (1, press.fisher_positions, press.fisher_labels)
     sampled_token_ids = press.last_sampled_token_ids.clone()
     assert press.last_ranking_check_passed is True
     assert press.last_full_cache_length == 128
@@ -327,7 +330,9 @@ def test_128_token_prefill_and_compressed_cache_decode_on_cpu():
         "compression_seconds",
         "total_seconds",
     }
-    assert press.last_profile["fisher_samples"] == press.fisher_samples
+    assert press.last_profile["fisher_positions"] == press.fisher_positions
+    assert press.last_profile["fisher_labels"] == press.fisher_labels
+    assert press.last_profile["fisher_probe_count"] == press._fisher_probe_count
     for layer in cache.layers:
         assert layer.keys.shape == (1, config.num_key_value_heads, 64, config.head_dim)
         assert layer.values.shape == (1, config.num_key_value_heads, 64, config.head_dim)

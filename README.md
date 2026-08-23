@@ -121,9 +121,12 @@ bash efficiency_evaluate.sh
 
 LogitKV uses a detached no-grad prefix and runs Fisher backward only on its trailing
 `fisher_window`. The KVPress pipeline selects this split-prefill path automatically.
-`fisher_samples` independently probes the corresponding number of trailing logit
-positions, averages their Fisher quadratic forms, and then applies the square root.
-It must be between 1 and `fisher_window`.
+`fisher_positions` selects trailing logit positions and must be between 1 and
+`fisher_window`. `fisher_labels` independently samples that many labels at each
+position. LogitKV averages all position-label Fisher quadratic forms before the
+square root.
+LogitKV Stage 2 uses `(attention_score + attention_eps) * fisher_rms`, with
+`attention_eps=0` by default; nonzero values are available for ablation.
 For direct model calls, use `press.prefill(model, input_ids, cache)` instead of the
 ordinary `with press(model)` API.
 

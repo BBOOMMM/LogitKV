@@ -166,7 +166,7 @@ def assert_root_squared_ranking(
         logger.warning(
             "LogitKV root/squared Top-K selections differ by %d membership entries "
             "(layer=%s, keep=%d/%d, compression_ratio=%.6f); "
-            "continuing with A * sqrt(Q + fisher_eps)",
+            "continuing with the root-form LogitKV score",
             mismatch_count,
             "unknown" if layer_idx is None else layer_idx,
             k,
@@ -191,16 +191,18 @@ class LogitKVPress(BasePress):
     """Memory-efficient online LogitKV with downstream Fisher sensitivity.
 
     The context is split into a detached no-grad prefix and a differentiable
-    trailing Fisher window. Independent probes from the trailing logit positions
-    accumulate per-layer Fisher quadratic forms, which are averaged before the
-    square root. The full cache is then compressed with CriticalKV's Stage-1
-    safeguard and per-head Top-K rule.
+    trailing Fisher window. ``fisher_positions`` trailing logit positions each
+    draw ``fisher_labels`` independent labels. Their per-layer Fisher quadratic
+    forms are averaged before the square root. The full cache is then compressed
+    with CriticalKV's Stage-1 safeguard and per-head Top-K rule.
     """
 
     press: ScorerPress
     fisher_window: int = 32
-    fisher_samples: int = 1
+    fisher_positions: int = 1
+    fisher_labels: int = 1
     first_stage_ratio: float = 0.5
+    attention_eps: float = 0.0
     fisher_eps: float = 1e-12
     sanity_check: bool = True
     fisher_seed: int | None = None
@@ -222,16 +224,27 @@ class LogitKVPress(BasePress):
     def __post_init__(self):
         if not isinstance(self.press, ScorerPress):
             raise TypeError("LogitKVPress requires a ScorerPress as input")
-        if self.fisher_window <= 0:
-            raise ValueError("fisher_window must be positive")
-        if self.fisher_samples <= 0:
-            raise ValueError("fisher_samples must be positive")
-        if self.fisher_samples > self.fisher_window:
-            raise ValueError("fisher_samples must not exceed fisher_window")
+        self._validate_fisher_configuration()
         if not 0 <= self.first_stage_ratio <= 1:
             raise ValueError("first_stage_ratio must be between 0 and 1")
+        if self.attention_eps < 0:
+            raise ValueError("attention_eps must be non-negative")
         if self.fisher_eps < 0:
             raise ValueError("fisher_eps must be non-negative")
+
+    @property
+    def _fisher_probe_count(self) -> int:
+        return self.fisher_positions * self.fisher_labels
+
+    def _validate_fisher_configuration(self) -> None:
+        if self.fisher_window <= 0:
+            raise ValueError("fisher_window must be positive")
+        if self.fisher_positions <= 0:
+            raise ValueError("fisher_positions must be positive")
+        if self.fisher_positions > self.fisher_window:
+            raise ValueError("fisher_positions must not exceed fisher_window")
+        if self.fisher_labels <= 0:
+            raise ValueError("fisher_labels must be positive")
 
     @property
     def compression_ratio(self) -> float:
@@ -339,13 +352,13 @@ class LogitKVPress(BasePress):
         raise RuntimeError("LogitKV could not find final logits in the model output")
 
     def _sample_log_probabilities(self, logits: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        """Sample one Fisher label at each of the trailing probe positions."""
+        """Sample Fisher labels independently at each trailing probe position."""
 
-        if logits.shape[1] < self.fisher_samples:
+        if logits.shape[1] < self.fisher_positions:
             raise ValueError(
-                f"Need {self.fisher_samples} trailing logits for Fisher probes, got {logits.shape[1]}"
+                f"Need {self.fisher_positions} trailing logits for Fisher probes, got {logits.shape[1]}"
             )
-        probe_logits = logits[:, -self.fisher_samples :, :].float()
+        probe_logits = logits[:, -self.fisher_positions :, :].float()
         if not probe_logits.requires_grad:
             raise RuntimeError(
                 "Fisher probe logits do not require gradients. Run LogitKV inside its context manager "
@@ -362,14 +375,17 @@ class LogitKVPress(BasePress):
         batch_size, num_positions, vocab_size = probabilities.shape
         sampled = torch.multinomial(
             probabilities.reshape(batch_size * num_positions, vocab_size),
-            num_samples=1,
+            num_samples=self.fisher_labels,
+            replacement=True,
             generator=generator,
-        ).reshape(batch_size, num_positions)
+        ).reshape(batch_size, num_positions, self.fisher_labels)
         self.last_sampled_token_ids = sampled.detach().cpu()
-        sampled_log_probabilities = torch.log_softmax(probe_logits, dim=-1).gather(
-            -1, sampled.unsqueeze(-1)
-        ).squeeze(-1)
-        return tuple(sampled_log_probabilities[:, sample_idx].mean() for sample_idx in range(num_positions))
+        sampled_log_probabilities = torch.log_softmax(probe_logits, dim=-1).gather(-1, sampled)
+        return tuple(
+            sampled_log_probabilities[:, position_idx, label_idx].mean()
+            for position_idx in range(num_positions)
+            for label_idx in range(self.fisher_labels)
+        )
 
     @staticmethod
     def _normal_tensor(tensor: torch.Tensor | None) -> torch.Tensor | None:
@@ -412,25 +428,26 @@ class LogitKVPress(BasePress):
                     self._gradient_counts[layer_idx] += 1
 
                 gradient_count = self._gradient_counts[layer_idx]
-                if gradient_count > self.fisher_samples:
+                if gradient_count > self._fisher_probe_count:
                     raise RuntimeError(
                         f"Layer {layer_idx} received {gradient_count} Fisher gradients; "
-                        f"expected {self.fisher_samples}"
+                        f"expected {self._fisher_probe_count}"
                     )
 
                 # Fisher matrices (and therefore their quadratic forms) are
                 # averaged before applying the square root.
-                if gradient_count == self.fisher_samples:
-                    fisher_quadratic_mean = self._quadratic_sums[layer_idx] / self.fisher_samples
+                if gradient_count == self._fisher_probe_count:
+                    fisher_quadratic_mean = self._quadratic_sums[layer_idx] / self._fisher_probe_count
                     fisher_rms = torch.sqrt(fisher_quadratic_mean.clamp_min(0.0) + self.fisher_eps)
-                    scores = state.base_scores * fisher_rms
+                    attention_scores = state.base_scores + self.attention_eps
+                    scores = attention_scores * fisher_rms
                     if not torch.isfinite(scores).all():
                         raise FloatingPointError(f"LogitKV produced non-finite scores at layer {layer_idx}")
 
                     n_kept = int(self._total_length * (1 - self.compression_ratio))
                     if self.sanity_check:
                         layer_ranking_check_passed = assert_root_squared_ranking(
-                            state.base_scores,
+                            attention_scores,
                             fisher_quadratic_mean,
                             n_kept,
                             self.fisher_eps,
@@ -453,11 +470,12 @@ class LogitKVPress(BasePress):
         incomplete = {
             layer_idx: self._gradient_counts.get(layer_idx, 0)
             for layer_idx in self._states
-            if self._gradient_counts.get(layer_idx, 0) != self.fisher_samples
+            if self._gradient_counts.get(layer_idx, 0) != self._fisher_probe_count
         }
         if incomplete:
             raise RuntimeError(
-                f"LogitKV received incomplete Fisher gradients {incomplete}; expected {self.fisher_samples} per layer"
+                f"LogitKV received incomplete Fisher gradients {incomplete}; "
+                f"expected {self._fisher_probe_count} per layer"
             )
         if self._states.keys() != self._scores.keys():
             missing = sorted(self._states.keys() - self._scores.keys())
@@ -513,10 +531,9 @@ class LogitKVPress(BasePress):
             raise NotImplementedError("LogitKV currently supports non-quantized DynamicCache only")
         if cache.get_seq_length() != 0:
             raise ValueError("LogitKV prefill requires an empty DynamicCache")
-        if self.fisher_samples <= 0:
-            raise ValueError("fisher_samples must be positive")
-        if self.fisher_samples > self.fisher_window:
-            raise ValueError("fisher_samples must not exceed fisher_window")
+        self._validate_fisher_configuration()
+        if self.attention_eps < 0:
+            raise ValueError("attention_eps must be non-negative")
 
         input_ids = self._normal_tensor(input_ids)
         attention_mask = self._normal_tensor(attention_mask)
@@ -596,7 +613,7 @@ class LogitKVPress(BasePress):
                         past_key_values=cache,
                         output_attentions=output_attentions,
                         use_cache=True,
-                        logits_to_keep=self.fisher_samples,
+                        logits_to_keep=self.fisher_positions,
                     )
                 self._sync_for_profile(device)
                 self._profile_values["suffix_forward_seconds"] = time.perf_counter() - phase_started_at
@@ -613,7 +630,7 @@ class LogitKVPress(BasePress):
                 self._sync_for_profile(device)
                 phase_started_at = time.perf_counter()
                 for sample_idx, probe in enumerate(probes):
-                    probe.backward(retain_graph=sample_idx < self.fisher_samples - 1)
+                    probe.backward(retain_graph=sample_idx < self._fisher_probe_count - 1)
                     suffix_embeds.grad = None
                 self._sync_for_profile(device)
                 self._profile_values["backward_with_score_seconds"] = time.perf_counter() - phase_started_at
@@ -631,7 +648,9 @@ class LogitKVPress(BasePress):
             )
             self.last_profile = {
                 **self._profile_values,
-                "fisher_samples": self.fisher_samples,
+                "fisher_positions": self.fisher_positions,
+                "fisher_labels": self.fisher_labels,
+                "fisher_probe_count": self._fisher_probe_count,
                 "total_seconds": time.perf_counter() - total_started_at,
             }
             if self.profile and device.type == "cuda":
