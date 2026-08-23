@@ -119,6 +119,11 @@ bash efficiency_evaluate.sh
 - `adasnapkv` - AdaKV
 - `snapkv` - SnapKV
 
+LogitKV uses a detached no-grad prefix and runs Fisher backward only on its trailing
+`fisher_window`. The KVPress pipeline selects this split-prefill path automatically.
+For direct model calls, use `press.prefill(model, input_ids, cache)` instead of the
+ordinary `with press(model)` API.
+
 ### Analyzing Results
 
 After running evaluations, use the provided scripts to analyze results:

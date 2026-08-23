@@ -53,7 +53,7 @@ from kvpress import (
 logger = logging.getLogger(__name__)
 
 PRESS_DICT = {
-    "logitkv": LogitKVPress(SnapKVPress()),
+    "logitkv": LogitKVPress(SnapKVPress(), fisher_seed=42),
     "criti_adasnapkv": CriticalAdaKVPress(SnapKVPress()),
     "criti_ada_expected_attention": CriticalAdaKVPress(ExpectedAttentionPress(use_vnorm=False)),
     "criti_snapkv": CriticalKVPress(SnapKVPress()),
@@ -77,6 +77,19 @@ PRESS_DICT = {
     "cake_global": CakeGlobalPress(),
     "fullkv": None,
 }
+
+
+def run_prefill(model, input_ids, cache, position_ids, press):
+    if isinstance(press, LogitKVPress):
+        return press.prefill(model, input_ids, cache, position_ids=position_ids)
+    with press(model) if press is not None else nullcontext():
+        return model(
+            input_ids=input_ids,
+            past_key_values=cache,
+            position_ids=position_ids,
+            logits_to_keep=1,
+        )
+
 
 @torch.inference_mode()
 def efficiency_evaluate(
@@ -124,12 +137,7 @@ def efficiency_evaluate(
         position_ids = torch.arange(
         0, context_length, device=model.device
         ).unsqueeze(0)
-        with press(model) if press is not None else nullcontext():
-            outputs = model(
-                input_ids=input_ids,
-                past_key_values=cache,
-                position_ids=position_ids,
-            )
+        outputs = run_prefill(model, input_ids, cache, position_ids, press)
         del outputs
         del cache
         del position_ids
@@ -162,13 +170,7 @@ def efficiency_evaluate(
         torch.cuda.synchronize()
         t = time.time()
         # prefill and compress kv cache
-        with press(model) if press is not None else nullcontext():
-            outputs = model(
-                input_ids=input_ids,
-                past_key_values=cache,
-                position_ids=position_ids,
-                # num_logits_to_keep=1,
-            )
+        outputs = run_prefill(model, input_ids, cache, position_ids, press)
         position_ids = position_ids[:, -1:] + 1
         generated_ids = [outputs.logits[0, -1].argmax()]
         # Clean up outputs to free memory

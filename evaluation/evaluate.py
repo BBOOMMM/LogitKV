@@ -72,7 +72,7 @@ SCORER_DICT = {
 }
 
 PRESS_DICT = {
-    "logitkv": LogitKVPress(SnapKVPress()),
+    "logitkv": LogitKVPress(SnapKVPress(), fisher_seed=42),
     "criti_adasnapkv": CriticalAdaKVPress(SnapKVPress()),
     "criti_ada_expected_attention": CriticalAdaKVPress(ExpectedAttentionPress(use_vnorm=False)),
     "criti_snapkv": CriticalKVPress(SnapKVPress()),
@@ -106,6 +106,8 @@ def evaluate(
     device: Optional[str] = None,
     press_name: str = "efficient_ada_denfensive",
     compression_ratio: float = 0.75,
+    fisher_window: int = 32,
+    fisher_seed: int = 42,
     fraction: float = 0.2,
     max_new_tokens: Optional[int] = None,
     max_context_length: Optional[int] = None,
@@ -128,6 +130,10 @@ def evaluate(
         Press to use (see PRESS_DICT), by default "expected_attention"
     compression_ratio : float, optional
         Compression ratio for the press, by default 0.1
+    fisher_window : int, optional
+        Number of trailing differentiable tokens used by LogitKV, by default 32
+    fisher_seed : int, optional
+        Sampling seed for LogitKV's one-sample Fisher probe, by default 42
     max_new_tokens : int, optional
         Maximum number of new tokens to generate, by default use the default for the task (recommended)
     fraction : float, optional
@@ -148,6 +154,10 @@ def evaluate(
             press.head_compression_ratio = compression_ratio
         else:
             press.compression_ratio = compression_ratio  # type:ignore[attr-definedif press is not None
+        if isinstance(press, LogitKVPress):
+            assert fisher_window > 0, "fisher_window must be positive"
+            press.fisher_window = fisher_window
+            press.fisher_seed = fisher_seed
     else:
         press = None
 
@@ -156,18 +166,20 @@ def evaluate(
 
     save_dir = Path(__file__).parent / "results"
     save_dir.mkdir(exist_ok=True)
-    save_filename = save_dir / (
-        "__".join(
-            [
-                dataset.replace("/", "--").split("--")[-1],
-                model.replace("/", "--").split("--")[-1],
-                str(press),
-                str(compression_ratio),
-                f"frac{fraction:.2f}",
-            ]
-        )
-        + ".csv"
-    )
+    filename_parts = [
+        dataset.replace("/", "--").split("--")[-1],
+        model.replace("/", "--").split("--")[-1],
+        press_name or "fullkv",
+        f"cr{compression_ratio:g}",
+    ]
+    if isinstance(press, LogitKVPress):
+        filename_parts.extend([f"fw{fisher_window}", f"fs{fisher_seed}"])
+    filename_parts.append(f"frac{fraction:.2f}")
+    if max_context_length is not None:
+        filename_parts.append(f"max_context{max_context_length}")
+    if compress_questions:
+        filename_parts.append("compressed_questions")
+    save_filename = save_dir / ("__".join(filename_parts) + ".csv")
     print("try save to:", save_filename)
     if save_filename.exists():
         logger.warning(f"Results already exist at {save_filename}")
@@ -189,17 +201,10 @@ def evaluate(
             sampled_task_df = task_df.sample(frac=fraction, random_state=42)
             sampled_dfs.append(sampled_task_df)
         df = pd.concat(sampled_dfs)
-        save_filename = save_filename.with_name(save_filename.stem + f"__fraction{fraction:.2f}" + save_filename.suffix)
-
-    if max_context_length is not None:
-        save_filename = save_filename.with_name(
-            save_filename.stem + f"__max_context{max_context_length}" + save_filename.suffix
-        )
 
     if compress_questions:
         df["context"] = df["context"] + df["question"]
         df["question"] = "\n"
-        save_filename = save_filename.with_name(save_filename.stem + "__compressed_questions" + save_filename.suffix)
 
     # Initialize pipeline with the correct attention implementation
     model_kwargs = {}

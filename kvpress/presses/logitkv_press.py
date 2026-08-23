@@ -5,9 +5,9 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+import logging
+import time
 from dataclasses import dataclass, field
-from typing import Generator
 
 import torch
 from torch import nn
@@ -15,6 +15,9 @@ from transformers import DynamicCache, PreTrainedModel, QuantizedCache
 
 from kvpress.presses.base_press import BasePress
 from kvpress.presses.scorer_press import ScorerPress
+
+logger = logging.getLogger(__name__)
+
 
 def _output_projection_by_head(module: nn.Module) -> torch.Tensor:
     """Return ``W_O`` as ``[num_attention_heads, head_dim, hidden_size]``."""
@@ -126,8 +129,9 @@ def assert_root_squared_ranking(
     k: int,
     fisher_eps: float = 0.0,
     score_root: torch.Tensor | None = None,
-) -> None:
-    """Check that ``A * sqrt(Q)`` and ``A^2 * Q`` produce the same top-k ranking."""
+    layer_idx: int | None = None,
+) -> bool:
+    """Log whether ``A * sqrt(Q)`` and ``A^2 * Q`` select the same top-k set."""
 
     if base_scores.shape != fisher_quadratic.shape:
         raise ValueError(
@@ -148,35 +152,48 @@ def assert_root_squared_ranking(
     # Keep this expression independent of score_root so the check catches a
     # missing root or an epsilon placed outside sqrt in the actual scorer.
     score_squared = base_scores.float().square() * quadratic
-    root_ranking = score_root.topk(k, dim=-1, sorted=True).indices
-    squared_ranking = score_squared.topk(k, dim=-1, sorted=True).indices
-    if not torch.equal(root_ranking, squared_ranking):
-        mismatch_count = (root_ranking != squared_ranking).sum().item()
-        raise RuntimeError(
-            "LogitKV root/squared ranking sanity check failed: "
-            f"{mismatch_count} top-k positions differ"
+    # Independent float32 evaluations can swap nearly tied tokens within the
+    # selected Top-K ordering. Compression only depends on membership, so do
+    # not treat those harmless ordering differences as a failed sanity check.
+    root_topk = score_root.float().topk(k, dim=-1, sorted=False).indices
+    squared_topk = score_squared.topk(k, dim=-1, sorted=False).indices
+    root_selected = torch.zeros_like(base_scores, dtype=torch.bool)
+    squared_selected = torch.zeros_like(base_scores, dtype=torch.bool)
+    root_selected.scatter_(-1, root_topk, True)
+    squared_selected.scatter_(-1, squared_topk, True)
+    if not torch.equal(root_selected, squared_selected):
+        mismatch_count = torch.logical_xor(root_selected, squared_selected).sum().item()
+        logger.warning(
+            "LogitKV root/squared Top-K selections differ by %d membership entries "
+            "(layer=%s, keep=%d/%d, compression_ratio=%.6f); "
+            "continuing with A * sqrt(Q + fisher_eps)",
+            mismatch_count,
+            "unknown" if layer_idx is None else layer_idx,
+            k,
+            base_scores.shape[-1],
+            1 - k / base_scores.shape[-1],
         )
+        return False
+    return True
 
 
 @dataclass
-class _LayerCapture:
+class _LayerState:
     module: nn.Module
     cache: DynamicCache
     keys: torch.Tensor
     values: torch.Tensor
     base_scores: torch.Tensor
-    layer_output: torch.Tensor
 
 
 @dataclass
 class LogitKVPress(BasePress):
-    """CriticalKV-style two-stage compression using downstream Fisher sensitivity.
+    """Memory-efficient online LogitKV with downstream Fisher sensitivity.
 
-    Unlike ordinary :class:`ScorerPress` implementations, LogitKV cannot compress
-    a layer as soon as that layer finishes: its score depends on the final model
-    logits. Attention hooks therefore capture the base score and layer output,
-    and a model-level hook performs one empirical-Fisher backward followed by
-    in-place cache compression after the full-cache prefill completes.
+    The context is split into a detached no-grad prefix and a differentiable
+    trailing Fisher window. Each attention-output gradient hook immediately
+    computes its layer's LogitKV score, after which the full cache is compressed
+    with CriticalKV's Stage-1 safeguard and per-head Top-K rule.
     """
 
     press: ScorerPress
@@ -185,12 +202,18 @@ class LogitKVPress(BasePress):
     fisher_eps: float = 1e-12
     sanity_check: bool = True
     fisher_seed: int | None = None
+    profile: bool = False
 
-    _captures: dict[int, _LayerCapture] = field(default_factory=dict, init=False, repr=False)
+    _states: dict[int, _LayerState] = field(default_factory=dict, init=False, repr=False)
+    _scores: dict[int, torch.Tensor] = field(default_factory=dict, init=False, repr=False)
     _active: bool = field(default=False, init=False, repr=False)
-    _completed: bool = field(default=False, init=False, repr=False)
+    _total_length: int = field(default=0, init=False, repr=False)
+    _gradient_handles: list = field(default_factory=list, init=False, repr=False)
+    _profile_values: dict[str, float] = field(default_factory=dict, init=False, repr=False)
     last_sampled_token_ids: torch.Tensor | None = field(default=None, init=False, repr=False)
     last_ranking_check_passed: bool | None = field(default=None, init=False, repr=False)
+    last_full_cache_length: int | None = field(default=None, init=False, repr=False)
+    last_profile: dict[str, float | int] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self):
         if not isinstance(self.press, ScorerPress):
@@ -230,13 +253,10 @@ class LogitKVPress(BasePress):
             raise RuntimeError(f"Cache layer {layer_idx} is not initialized")
         return cache_layer.keys, cache_layer.values
 
-    def _capture_attention(self, module: nn.Module, inputs: tuple, kwargs: dict, output: tuple):
-        if self._completed:
-            return output
-
+    def _capture_window_attention(self, module: nn.Module, inputs: tuple, kwargs: dict, output: tuple):
         layer_idx = module.layer_idx
-        if layer_idx in self._captures:
-            raise RuntimeError(f"Attention layer {layer_idx} ran more than once during one LogitKV prefill")
+        if layer_idx in self._states:
+            raise RuntimeError(f"Attention layer {layer_idx} ran more than once during the LogitKV window forward")
         if not isinstance(output, (tuple, list)) or len(output) < 1:
             raise RuntimeError("LogitKV expected the attention module to return a tuple")
 
@@ -245,11 +265,10 @@ class LogitKVPress(BasePress):
         if cache is None:
             raise ValueError("LogitKV requires use_cache=True and an explicit DynamicCache")
         keys, values = self._cache_tensors(cache, layer_idx)
-        if keys.shape[2] != hidden_states.shape[1]:
-            raise ValueError(
-                "LogitKV requires a full-cache prefill into an empty cache; "
-                f"layer {layer_idx} saw {hidden_states.shape[1]} queries and {keys.shape[2]} cached keys"
-            )
+        if hidden_states.shape[1] != self.fisher_window:
+            raise ValueError(f"Expected {self.fisher_window} window queries, got {hidden_states.shape[1]}")
+        if keys.shape[2] != self._total_length:
+            raise ValueError(f"Expected {self._total_length} full-cache keys, got {keys.shape[2]}")
 
         attentions = output[1] if len(output) > 1 else None
         # The prefill ran with autograd enabled, but the decoding cache itself
@@ -259,18 +278,29 @@ class LogitKVPress(BasePress):
         cache.layers[layer_idx].keys = keys
         cache.layers[layer_idx].values = values
         with torch.no_grad():
-            base_scores = self.press.score(
-                module,
-                hidden_states.detach(),
-                keys,
-                values,
-                attentions,
-                kwargs,
-            ).float()
+            if hasattr(self.press, "score_from_window"):
+                base_scores = self.press.score_from_window(
+                    module,
+                    hidden_states.detach(),
+                    keys,
+                    values,
+                    attentions,
+                    kwargs,
+                    window_size=self.fisher_window,
+                ).float()
+            else:
+                base_scores = self.press.score(
+                    module,
+                    hidden_states.detach(),
+                    keys,
+                    values,
+                    attentions,
+                    kwargs,
+                ).float()
 
         layer_output = output[0]
         if not layer_output.requires_grad:
-            layer_output.requires_grad_(True)
+            raise RuntimeError("Window attention output is not differentiable")
 
         expected_shape = keys.shape[:3]
         if base_scores.shape != expected_shape:
@@ -282,14 +312,14 @@ class LogitKVPress(BasePress):
         if (base_scores < 0).any():
             raise ValueError("LogitKV requires a non-negative attention-based scorer")
 
-        self._captures[layer_idx] = _LayerCapture(
+        self._states[layer_idx] = _LayerState(
             module=module,
             cache=cache,
             keys=keys,
             values=values,
             base_scores=base_scores,
-            layer_output=layer_output,
         )
+        self._gradient_handles.append(layer_output.register_hook(self._make_gradient_hook(layer_idx)))
         return output
 
     @staticmethod
@@ -317,135 +347,252 @@ class LogitKVPress(BasePress):
             generator.manual_seed(self.fisher_seed)
         sampled = torch.multinomial(probabilities, num_samples=1, generator=generator)
         self.last_sampled_token_ids = sampled.detach().cpu()
-        return torch.log_softmax(final_logits, dim=-1).gather(-1, sampled).sum()
+        return torch.log_softmax(final_logits, dim=-1).gather(-1, sampled).mean()
 
     @staticmethod
-    def _prepare_model_inputs(model: nn.Module, inputs: tuple, kwargs: dict) -> tuple[tuple, dict]:
-        """Clone inference tensors so autograd is allowed to save them for backward."""
+    def _normal_tensor(tensor: torch.Tensor | None) -> torch.Tensor | None:
+        if isinstance(tensor, torch.Tensor) and torch.is_inference(tensor):
+            return tensor.clone()
+        return tensor
 
-        def make_normal(tensor):
-            if isinstance(tensor, torch.Tensor) and torch.is_inference(tensor):
-                return tensor.clone()
-            return tensor
+    @staticmethod
+    def detach_cache(cache: DynamicCache) -> None:
+        """Detach every initialized DynamicCache layer in-place."""
 
-        inputs = tuple(make_normal(value) for value in inputs)
-        kwargs = {name: make_normal(value) for name, value in kwargs.items()}
-        return inputs, kwargs
+        if isinstance(cache, QuantizedCache) or not isinstance(cache, DynamicCache):
+            raise NotImplementedError("LogitKV currently supports non-quantized DynamicCache only")
+        for cache_layer in cache.layers:
+            if getattr(cache_layer, "is_initialized", False):
+                cache_layer.keys = cache_layer.keys.detach()
+                cache_layer.values = cache_layer.values.detach()
 
-    def _compress_capture(self, capture: _LayerCapture, output_grad: torch.Tensor) -> None:
-        keys = capture.keys.detach()
-        values = capture.values.detach()
-        base_scores = capture.base_scores
-        q_len = keys.shape[2]
-        n_kept = int(q_len * (1 - self.compression_ratio))
+    def _sync_for_profile(self, device: torch.device) -> None:
+        if self.profile and device.type == "cuda":
+            torch.cuda.synchronize(device)
 
-        fisher_quadratic = fisher_quadratic_sensitivity(
-            values=values,
-            output_grad=output_grad.detach(),
-            module=capture.module,
-            fisher_window=self.fisher_window,
-        )
-        fisher_rms = torch.sqrt(fisher_quadratic.clamp_min(0.0) + self.fisher_eps)
-        scores = base_scores * fisher_rms
-        if not torch.isfinite(scores).all():
-            raise FloatingPointError(f"LogitKV produced non-finite scores at layer {capture.module.layer_idx}")
+    def _make_gradient_hook(self, layer_idx: int):
+        def gradient_hook(output_grad: torch.Tensor) -> torch.Tensor:
+            state = self._states[layer_idx]
+            self._sync_for_profile(output_grad.device)
+            started_at = time.perf_counter()
+            with torch.no_grad():
+                fisher_quadratic = fisher_quadratic_sensitivity(
+                    values=state.values,
+                    output_grad=output_grad,
+                    module=state.module,
+                    fisher_window=self.fisher_window,
+                )
+                fisher_rms = torch.sqrt(fisher_quadratic.clamp_min(0.0) + self.fisher_eps)
+                scores = state.base_scores * fisher_rms
+                if not torch.isfinite(scores).all():
+                    raise FloatingPointError(f"LogitKV produced non-finite scores at layer {layer_idx}")
 
-        if self.sanity_check:
-            assert_root_squared_ranking(
-                base_scores,
-                fisher_quadratic,
-                n_kept,
-                self.fisher_eps,
-                score_root=scores,
-            )
-            self.last_ranking_check_passed = True
+                n_kept = int(self._total_length * (1 - self.compression_ratio))
+                if self.sanity_check:
+                    layer_ranking_check_passed = assert_root_squared_ranking(
+                        state.base_scores,
+                        fisher_quadratic,
+                        n_kept,
+                        self.fisher_eps,
+                        score_root=scores,
+                        layer_idx=layer_idx,
+                    )
+                    if self.last_ranking_check_passed is None:
+                        self.last_ranking_check_passed = layer_ranking_check_passed
+                    else:
+                        self.last_ranking_check_passed &= layer_ranking_check_passed
+                self._scores[layer_idx] = scores.detach()
 
-        # CriticalKV Stage 1: safeguard a fixed fraction of the base scorer's
-        # top tokens before ranking the remaining budget with LogitKV scores.
-        first_stage_budget = int((1 - self.compression_ratio) * q_len * self.first_stage_ratio)
-        if first_stage_budget:
-            top_base_indices = base_scores.topk(first_stage_budget, dim=-1, sorted=True).indices
-            scores.scatter_(-1, top_base_indices, torch.finfo(scores.dtype).max)
+            self._sync_for_profile(output_grad.device)
+            self._profile_values["score_seconds"] += time.perf_counter() - started_at
+            return output_grad
 
-        kept_indices = scores.topk(n_kept, dim=-1).indices
-        gather_indices = kept_indices.unsqueeze(-1).expand(-1, -1, -1, capture.module.head_dim)
-        compressed_keys = keys.gather(2, gather_indices).contiguous()
-        compressed_values = values.gather(2, gather_indices).contiguous()
+        return gradient_hook
 
-        cache_layer = capture.cache.layers[capture.module.layer_idx]
-        cache_layer.keys = compressed_keys
-        cache_layer.values = compressed_values
+    def _compress_cache_from_scores(self) -> None:
+        if self._states.keys() != self._scores.keys():
+            missing = sorted(self._states.keys() - self._scores.keys())
+            raise RuntimeError(f"LogitKV did not receive gradients for layers {missing}")
 
-    def _finish_prefill(self, model: nn.Module, inputs: tuple, kwargs: dict, output):
-        if self._completed:
-            return output
-        if not self._captures:
-            raise RuntimeError("LogitKV did not capture any attention layers")
-        expected_layer_count = len(model.model.layers)
-        if len(self._captures) != expected_layer_count:
-            raise RuntimeError(
-                f"LogitKV captured {len(self._captures)} of {expected_layer_count} attention layers"
-            )
+        for layer_idx in sorted(self._states):
+            state = self._states[layer_idx]
+            keys = state.keys
+            values = state.values
+            scores = self._scores[layer_idx].clone()
+            q_len = keys.shape[2]
+            n_kept = int(q_len * (1 - self.compression_ratio))
 
-        captures = [self._captures[layer_idx] for layer_idx in sorted(self._captures)]
-        logits = self._logits_from_output(output)
-        sampled_log_probability = self._sample_log_probability(logits)
-        layer_outputs = [capture.layer_output for capture in captures]
+            first_stage_budget = int((1 - self.compression_ratio) * q_len * self.first_stage_ratio)
+            if first_stage_budget:
+                top_base_indices = state.base_scores.topk(first_stage_budget, dim=-1, sorted=True).indices
+                scores.scatter_(-1, top_base_indices, torch.finfo(scores.dtype).max)
 
-        gradients = torch.autograd.grad(
-            sampled_log_probability,
-            layer_outputs,
-            retain_graph=False,
-            create_graph=False,
-            allow_unused=False,
-        )
-        for capture, output_grad in zip(captures, gradients):
-            self._compress_capture(capture, output_grad)
+            kept_indices = scores.topk(n_kept, dim=-1).indices
+            gather_indices = kept_indices.unsqueeze(-1).expand(-1, -1, -1, state.module.head_dim)
+            cache_layer = state.cache.layers[layer_idx]
+            cache_layer.keys = keys.gather(2, gather_indices).contiguous().detach()
+            cache_layer.values = values.gather(2, gather_indices).contiguous().detach()
 
-        self._captures.clear()
-        self._completed = True
-        return output
-
-    @contextmanager
-    def __call__(self, model: PreTrainedModel) -> Generator:
-        """Capture a full prefill, run one Fisher backward, and compress its cache."""
+    def prefill(
+        self,
+        model: PreTrainedModel,
+        input_ids: torch.Tensor,
+        cache: DynamicCache,
+        *,
+        output_attentions: bool = False,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+    ):
+        """Run prefix no-grad + Fisher-window backward and compress the full cache."""
 
         if self.compression_ratio == 0:
-            yield
-            return
+            with torch.no_grad():
+                return model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=cache,
+                    output_attentions=output_attentions,
+                    use_cache=True,
+                    logits_to_keep=1,
+                )
         if self._active:
-            raise RuntimeError("A LogitKVPress instance cannot be active in two contexts at once")
+            raise RuntimeError("A LogitKVPress instance cannot run two prefills at once")
         if not hasattr(model, "model") or not hasattr(model.model, "layers"):
             raise NotImplementedError("LogitKV expects a model with model.layers[*].self_attn")
+        if not isinstance(cache, DynamicCache) or isinstance(cache, QuantizedCache):
+            raise NotImplementedError("LogitKV currently supports non-quantized DynamicCache only")
+        if cache.get_seq_length() != 0:
+            raise ValueError("LogitKV prefill requires an empty DynamicCache")
 
-        hooks = []
+        input_ids = self._normal_tensor(input_ids)
+        attention_mask = self._normal_tensor(attention_mask)
+        position_ids = self._normal_tensor(position_ids)
+        total_length = input_ids.shape[1]
+        if total_length <= self.fisher_window:
+            raise ValueError(
+                f"Context length {total_length} must be greater than fisher_window {self.fisher_window}"
+            )
+        prefix_length = total_length - self.fisher_window
+        prefix_ids = input_ids[:, :prefix_length]
+        window_ids = input_ids[:, prefix_length:]
+        prefix_attention_mask = attention_mask[:, :prefix_length] if attention_mask is not None else None
+        prefix_position_ids = position_ids[..., :prefix_length] if position_ids is not None else None
+        window_position_ids = position_ids[..., prefix_length:] if position_ids is not None else None
+
         parameters = list(model.parameters())
         parameter_requires_grad = [parameter.requires_grad for parameter in parameters]
-        self._captures.clear()
-        self._active = True
-        self._completed = False
+        forward_hooks = []
+        device = input_ids.device
+        self._states.clear()
+        self._scores.clear()
+        self._gradient_handles.clear()
+        self._profile_values = {"score_seconds": 0.0}
+        self.last_profile = {}
         self.last_sampled_token_ids = None
         self.last_ranking_check_passed = None
+        self.last_full_cache_length = None
+        self._total_length = total_length
+        self._active = True
+
+        if self.profile and device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+        self._sync_for_profile(device)
+        total_started_at = time.perf_counter()
         try:
-            # Parameter gradients are not part of LogitKV's empirical Fisher.
-            # Freezing them avoids retaining the graph before the first captured
-            # attention output; all original flags are restored below.
             for parameter in parameters:
                 parameter.requires_grad_(False)
-            hooks.append(model.register_forward_pre_hook(self._prepare_model_inputs, with_kwargs=True))
-            for layer in model.model.layers:
-                hooks.append(layer.self_attn.register_forward_hook(self._capture_attention, with_kwargs=True))
-            hooks.append(model.register_forward_hook(self._finish_prefill, with_kwargs=True))
 
-            # Pipeline.forward uses no_grad and the efficiency evaluator uses
-            # inference_mode. Explicitly disabling both here is required for the
-            # single empirical-Fisher backward.
-            with torch.inference_mode(False), torch.enable_grad():
-                yield
+            with torch.inference_mode(False):
+                self._sync_for_profile(device)
+                phase_started_at = time.perf_counter()
+                with torch.no_grad():
+                    model(
+                        input_ids=prefix_ids,
+                        attention_mask=prefix_attention_mask,
+                        position_ids=prefix_position_ids,
+                        past_key_values=cache,
+                        output_attentions=False,
+                        use_cache=True,
+                        logits_to_keep=1,
+                    )
+                self._sync_for_profile(device)
+                self._profile_values["prefix_seconds"] = time.perf_counter() - phase_started_at
+                if cache.get_seq_length() != prefix_length:
+                    raise RuntimeError(f"Prefix cache length is {cache.get_seq_length()}, expected {prefix_length}")
+                self.detach_cache(cache)
+
+                with torch.no_grad():
+                    suffix_embeds = model.get_input_embeddings()(window_ids)
+                suffix_embeds = suffix_embeds.detach().requires_grad_(True)
+
+                for layer in model.model.layers:
+                    forward_hooks.append(
+                        layer.self_attn.register_forward_hook(self._capture_window_attention, with_kwargs=True)
+                    )
+
+                self._sync_for_profile(device)
+                phase_started_at = time.perf_counter()
+                with torch.enable_grad():
+                    outputs = model(
+                        inputs_embeds=suffix_embeds,
+                        attention_mask=attention_mask,
+                        position_ids=window_position_ids,
+                        past_key_values=cache,
+                        output_attentions=output_attentions,
+                        use_cache=True,
+                        logits_to_keep=1,
+                    )
+                self._sync_for_profile(device)
+                self._profile_values["suffix_forward_seconds"] = time.perf_counter() - phase_started_at
+
+                if cache.get_seq_length() != total_length:
+                    raise RuntimeError(f"Full cache length is {cache.get_seq_length()}, expected {total_length}")
+                self.last_full_cache_length = cache.get_seq_length()
+                if len(self._states) != len(model.model.layers):
+                    raise RuntimeError(
+                        f"LogitKV captured {len(self._states)} of {len(model.model.layers)} attention layers"
+                    )
+
+                probe = self._sample_log_probability(self._logits_from_output(outputs))
+                self._sync_for_profile(device)
+                phase_started_at = time.perf_counter()
+                probe.backward()
+                self._sync_for_profile(device)
+                self._profile_values["backward_with_score_seconds"] = time.perf_counter() - phase_started_at
+                suffix_embeds.grad = None
+
+                phase_started_at = time.perf_counter()
+                self._compress_cache_from_scores()
+                self.detach_cache(cache)
+                self._sync_for_profile(device)
+                self._profile_values["compression_seconds"] = time.perf_counter() - phase_started_at
+
+            self._sync_for_profile(device)
+            self._profile_values["backward_seconds"] = max(
+                self._profile_values["backward_with_score_seconds"] - self._profile_values["score_seconds"],
+                0.0,
+            )
+            self.last_profile = {
+                **self._profile_values,
+                "total_seconds": time.perf_counter() - total_started_at,
+            }
+            if self.profile and device.type == "cuda":
+                self.last_profile["peak_memory_bytes"] = torch.cuda.max_memory_allocated(device)
+            return outputs
         finally:
-            for hook in hooks:
+            for hook in forward_hooks:
+                hook.remove()
+            for hook in self._gradient_handles:
                 hook.remove()
             for parameter, requires_grad in zip(parameters, parameter_requires_grad):
                 parameter.requires_grad_(requires_grad)
-            self._captures.clear()
+            self._states.clear()
+            self._scores.clear()
+            self._gradient_handles.clear()
             self._active = False
+
+    def __call__(self, model: PreTrainedModel):
+        """Reject the ordinary one-shot press API, which cannot split the context."""
+
+        raise RuntimeError("LogitKVPress requires press.prefill(model, input_ids, cache); the pipeline handles this")

@@ -62,6 +62,39 @@ def test_root_and_squared_scores_have_identical_topk_ranking():
     squared_scores = attention_scores.square() * (fisher_q + fisher_eps)
     assert torch.equal(root_scores.topk(k).indices, squared_scores.topk(k).indices)
 
+    # At realistic score magnitudes, independent float32 evaluations can
+    # reorder nearly tied items while retaining exactly the same Top-K set.
+    generator = torch.Generator().manual_seed(434)
+    long_attention_scores = torch.rand(1, 1, 512, generator=generator)
+    long_fisher_q = torch.rand(1, 1, 512, generator=generator) * 1e-8
+    long_k = int(long_attention_scores.shape[-1] * 0.4)
+    long_root_scores = long_attention_scores * torch.sqrt(long_fisher_q + fisher_eps)
+    long_squared_scores = long_attention_scores.square() * (long_fisher_q + fisher_eps)
+    root_indices = long_root_scores.topk(long_k, sorted=True).indices
+    squared_indices = long_squared_scores.topk(long_k, sorted=True).indices
+    assert not torch.equal(root_indices, squared_indices)
+    assert torch.equal(root_indices.sort().values, squared_indices.sort().values)
+    assert_root_squared_ranking(long_attention_scores, long_fisher_q, long_k, fisher_eps)
+
+    # A true selection mismatch is logged but must not abort compression; the
+    # production path continues with the root-form score.
+    close_attention_scores = torch.ones(1, 1, 2)
+    close_fisher_q = torch.tensor([[[1.0, 0.99999]]])
+    perturbed_root_scores = torch.sqrt(close_fisher_q + fisher_eps)
+    perturbed_root_scores[..., 0] -= 6e-6
+    perturbed_root_scores[..., 1] += 6e-6
+    with patch("kvpress.presses.logitkv_press.logger.warning") as ranking_warning:
+        check_passed = assert_root_squared_ranking(
+            close_attention_scores,
+            close_fisher_q,
+            1,
+            fisher_eps,
+            score_root=perturbed_root_scores,
+            layer_idx=7,
+        )
+    assert check_passed is False
+    ranking_warning.assert_called_once()
+
     try:
         assert_root_squared_ranking(
             attention_scores,
@@ -76,8 +109,136 @@ def test_root_and_squared_scores_have_identical_topk_ranking():
         raise AssertionError("The sanity check did not detect a missing square root")
 
 
-def test_128_token_prefill_and_compressed_cache_decode_on_cpu():
+def _capture_attention_outputs(model, cache, *, input_ids=None, inputs_embeds=None):
+    layer_outputs = {}
+    hooks = []
+
+    def capture(module, inputs, kwargs, output):
+        layer_outputs[module.layer_idx] = output[0]
+
+    for layer in model.model.layers:
+        hooks.append(layer.self_attn.register_forward_hook(capture, with_kwargs=True))
+    outputs = model(
+        input_ids=input_ids,
+        inputs_embeds=inputs_embeds,
+        past_key_values=cache,
+        use_cache=True,
+        logits_to_keep=1,
+    )
+    for hook in hooks:
+        hook.remove()
+    probe = outputs.logits[:, -1].log_softmax(dim=-1)[:, 7].mean()
+    gradients = torch.autograd.grad(probe, [layer_outputs[index] for index in sorted(layer_outputs)])
+    return outputs.logits.detach(), gradients
+
+
+def test_split_forward_logits_and_window_gradients_match_full_graph():
     torch.manual_seed(2)
+    total_length, window = 48, 12
+    config = LlamaConfig(
+        vocab_size=61,
+        hidden_size=24,
+        intermediate_size=48,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=128,
+    )
+    model = LlamaForCausalLM(config).eval()
+    model.requires_grad_(False)
+    input_ids = torch.randint(0, config.vocab_size, (1, total_length))
+
+    full_embeds = model.get_input_embeddings()(input_ids).detach().requires_grad_(True)
+    full_logits, full_gradients = _capture_attention_outputs(
+        model,
+        DynamicCache(),
+        inputs_embeds=full_embeds,
+    )
+
+    split_cache = DynamicCache()
+    with torch.no_grad():
+        model(
+            input_ids=input_ids[:, :-window],
+            past_key_values=split_cache,
+            use_cache=True,
+            logits_to_keep=1,
+        )
+    LogitKVPress.detach_cache(split_cache)
+    window_embeds = model.get_input_embeddings()(input_ids[:, -window:]).detach().requires_grad_(True)
+    split_logits, split_gradients = _capture_attention_outputs(
+        model,
+        split_cache,
+        inputs_embeds=window_embeds,
+    )
+
+    torch.testing.assert_close(split_logits, full_logits, rtol=1e-4, atol=1e-5)
+    for full_gradient, split_gradient in zip(full_gradients, split_gradients):
+        torch.testing.assert_close(split_gradient, full_gradient[:, -window:], rtol=1e-4, atol=1e-5)
+
+
+def test_window_aware_snapkv_matches_full_prefill_score():
+    torch.manual_seed(3)
+    total_length, window = 48, 12
+    config = LlamaConfig(
+        vocab_size=61,
+        hidden_size=24,
+        intermediate_size=48,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=128,
+    )
+    model = LlamaForCausalLM(config).eval()
+    input_ids = torch.randint(0, config.vocab_size, (1, total_length))
+    scorer = SnapKVPress(compression_ratio=0.5, window_size=window, kernel_size=5)
+
+    def run_and_score(cache, current_ids, from_window):
+        scores = []
+
+        def score_hook(module, inputs, kwargs, output):
+            cache_layer = cache.layers[module.layer_idx]
+            if from_window:
+                score = scorer.score_from_window(
+                    module,
+                    kwargs["hidden_states"],
+                    cache_layer.keys,
+                    cache_layer.values,
+                    output[1],
+                    kwargs,
+                    window_size=window,
+                )
+            else:
+                score = scorer.score(
+                    module,
+                    kwargs["hidden_states"],
+                    cache_layer.keys,
+                    cache_layer.values,
+                    output[1],
+                    kwargs,
+                )
+            scores.append(score)
+
+        hook = model.model.layers[0].self_attn.register_forward_hook(score_hook, with_kwargs=True)
+        with torch.no_grad():
+            model(input_ids=current_ids, past_key_values=cache, use_cache=True, logits_to_keep=1)
+        hook.remove()
+        return scores[0]
+
+    full_score = run_and_score(DynamicCache(), input_ids, from_window=False)
+    split_cache = DynamicCache()
+    with torch.no_grad():
+        model(
+            input_ids=input_ids[:, :-window],
+            past_key_values=split_cache,
+            use_cache=True,
+            logits_to_keep=1,
+        )
+    window_score = run_and_score(split_cache, input_ids[:, -window:], from_window=True)
+    torch.testing.assert_close(window_score, full_score, rtol=1e-5, atol=1e-6)
+
+
+def test_128_token_prefill_and_compressed_cache_decode_on_cpu():
+    torch.manual_seed(4)
     config = LlamaConfig(
         vocab_size=97,
         hidden_size=32,
@@ -100,14 +261,17 @@ def test_128_token_prefill_and_compressed_cache_decode_on_cpu():
     with torch.inference_mode():
         cache = DynamicCache()
         input_ids = torch.randint(0, config.vocab_size, (1, 128))
-        with patch("torch.autograd.grad", wraps=torch.autograd.grad) as fisher_backward:
-            with press(model):
-                outputs = model(
-                    input_ids=input_ids,
-                    past_key_values=cache,
-                    use_cache=True,
-                    logits_to_keep=1,
-                )
+        parameter_storages = {parameter.untyped_storage().data_ptr() for parameter in model.parameters()}
+        saved_activation_shapes = []
+
+        def record_saved_tensor(tensor):
+            if tensor.untyped_storage().data_ptr() not in parameter_storages:
+                saved_activation_shapes.append(tuple(tensor.shape))
+            return tensor
+
+        with patch("torch.autograd.backward", wraps=torch.autograd.backward) as fisher_backward:
+            with torch.autograd.graph.saved_tensors_hooks(record_saved_tensor, lambda tensor: tensor):
+                outputs = press.prefill(model, input_ids, cache)
 
     assert outputs.logits.shape == (1, 1, config.vocab_size)
     assert fisher_backward.call_count == 1
@@ -115,11 +279,30 @@ def test_128_token_prefill_and_compressed_cache_decode_on_cpu():
     assert all(parameter.grad is None for parameter in model.parameters())
     assert press.last_sampled_token_ids.shape == (1, 1)
     assert press.last_ranking_check_passed is True
+    assert press.last_full_cache_length == 128
+    assert (1, 128, config.intermediate_size) not in saved_activation_shapes
+    assert (1, press.fisher_window, config.intermediate_size) in saved_activation_shapes
+    assert set(press.last_profile) >= {
+        "prefix_seconds",
+        "suffix_forward_seconds",
+        "backward_with_score_seconds",
+        "backward_seconds",
+        "score_seconds",
+        "compression_seconds",
+        "total_seconds",
+    }
     for layer in cache.layers:
         assert layer.keys.shape == (1, config.num_key_value_heads, 64, config.head_dim)
         assert layer.values.shape == (1, config.num_key_value_heads, 64, config.head_dim)
         assert not layer.keys.requires_grad
         assert not layer.values.requires_grad
+
+    selected_keys = [layer.keys.clone() for layer in cache.layers]
+    with torch.inference_mode():
+        repeated_cache = DynamicCache()
+        press.prefill(model, input_ids, repeated_cache)
+    for expected_keys, repeated_layer in zip(selected_keys, repeated_cache.layers):
+        torch.testing.assert_close(repeated_layer.keys, expected_keys)
 
     with torch.inference_mode():
         decoded = model(

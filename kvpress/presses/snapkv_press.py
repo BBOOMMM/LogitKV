@@ -32,13 +32,21 @@ class SnapKVPress(ScorerPress):
     @staticmethod
     def compute_window_attention(module, hidden_states, keys, window_size, position_embeddings):
         """
-        Compute the last window_size queries and associated attention weights for the first q_len - window_size keys.
+        Compute trailing-window queries over a full KV cache.
+
+        ``hidden_states`` may contain either the full prefill or only the trailing
+        window. ``keys`` always contains the complete prefix + window cache.
         """
 
-        bsz, q_len, _ = hidden_states.shape
+        hidden_length = hidden_states.shape[1]
+        total_length = keys.shape[2]
         num_heads = module.config.num_attention_heads
         head_dim = module.head_dim
         num_key_value_groups = num_heads // module.config.num_key_value_heads
+        if hidden_length < window_size:
+            raise ValueError(f"Need {window_size} query states, got {hidden_length}")
+        if total_length <= window_size:
+            raise ValueError(f"Cache length {total_length} must be greater than window size {window_size}")
 
         # # Get last window_size queries
         # if hasattr(module, "q_proj"):
@@ -56,22 +64,75 @@ class SnapKVPress(ScorerPress):
 
         # Get last window_size queries
         query_states = get_prerope_query_states(module, hidden_states[:, -window_size:])
-        
+
         # Apply RoPE
         cos, sin = position_embeddings
         cos, sin = cos[:, -window_size:], sin[:, -window_size:]
         query_states = (query_states * cos.unsqueeze(1)) + (rotate_half(query_states) * sin.unsqueeze(1))
 
-        # Compute attention for first q_len - window_size tokens
+        # Compute attention for the historical tokens and protect the window.
         key_states = repeat_kv(keys, num_key_value_groups)
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(head_dim)
-        attention_mask = torch.ones_like(attn_weights) * float("-inf")
-        attention_mask = torch.triu(attention_mask, diagonal=q_len - window_size + 1)
-        attn_weights += attention_mask
+        prefix_length = total_length - window_size
+        key_positions = torch.arange(total_length, device=attn_weights.device)
+        query_positions = prefix_length + torch.arange(window_size, device=attn_weights.device)
+        causal_mask = key_positions.unsqueeze(0) > query_positions.unsqueeze(1)
+        attn_weights.masked_fill_(causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_weights = attn_weights[..., :-window_size]
 
         return attn_weights
+
+    def _score_with_window(
+        self,
+        module: nn.Module,
+        hidden_states: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        attentions: torch.Tensor,
+        kwargs,
+        window_size: int,
+    ) -> torch.Tensor:
+
+        bsz, num_key_value_heads, total_length, _ = keys.shape
+        num_key_value_groups = module.config.num_attention_heads // num_key_value_heads
+
+        if total_length <= window_size:
+            raise ValueError("Cache length should be greater than the window size")
+
+        if attentions is not None:
+            attn_weights = attentions[..., -window_size:, :-window_size]
+        else:
+            attn_weights = self.compute_window_attention(
+                module, hidden_states, keys, window_size, kwargs["position_embeddings"]
+            )
+
+        scores = attn_weights.mean(dim=-2)
+        scores = F.avg_pool1d(scores, kernel_size=self.kernel_size, padding=self.kernel_size // 2, stride=1)
+
+        # Average per group (https://github.com/FasterDecoding/SnapKV/issues/22)
+        scores = scores.view(bsz, num_key_value_heads, num_key_value_groups, total_length - window_size)
+        scores = scores.mean(2)
+
+        # Add back the observation window. Use max score to make sure the window is not pruned.
+        scores = F.pad(scores, (0, window_size), value=scores.max().item())
+
+        return scores
+
+    def score_from_window(
+        self,
+        module: nn.Module,
+        hidden_states: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        attentions: torch.Tensor,
+        kwargs,
+        window_size: int | None = None,
+    ) -> torch.Tensor:
+        """Score a full cache from only its trailing observation-window states."""
+
+        window_size = hidden_states.shape[1] if window_size is None else window_size
+        return self._score_with_window(module, hidden_states, keys, values, attentions, kwargs, window_size)
 
     def score(
         self,
@@ -82,27 +143,12 @@ class SnapKVPress(ScorerPress):
         attentions: torch.Tensor,
         kwargs,
     ) -> torch.Tensor:
-
-        bsz, num_key_value_heads, q_len, _ = keys.shape
-        num_key_value_groups = module.config.num_attention_heads // num_key_value_heads
-
-        assert q_len > self.window_size, "Query length should be greater than the window size"
-
-        if attentions is not None:
-            attn_weights = attentions[..., -self.window_size :, : -self.window_size]
-        else:
-            attn_weights = self.compute_window_attention(
-                module, hidden_states, keys, self.window_size, kwargs["position_embeddings"]
-            )
-
-        scores = attn_weights.mean(dim=-2)
-        scores = F.avg_pool1d(scores, kernel_size=self.kernel_size, padding=self.kernel_size // 2, stride=1)
-
-        # Average per grioup (https://github.com/FasterDecoding/SnapKV/issues/22)
-        scores = scores.view(bsz, num_key_value_heads, num_key_value_groups, q_len - self.window_size)
-        scores = scores.mean(2)
-
-        # Add back the observation window. Use max score to make sure the window is not pruned.
-        scores = F.pad(scores, (0, self.window_size), value=scores.max().item())
-
-        return scores
+        return self._score_with_window(
+            module,
+            hidden_states,
+            keys,
+            values,
+            attentions,
+            kwargs,
+            self.window_size,
+        )

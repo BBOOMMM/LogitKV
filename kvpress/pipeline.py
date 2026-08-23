@@ -19,6 +19,7 @@ from kvpress.presses.efficient_ada_global_scorer_press import EfficientAdaGlobal
 from kvpress.presses.cake_scorer_press import CakeScorerPress
 from kvpress.ada_cache import DynamicCacheSplitHeadFlatten
 from kvpress.presses.key_rerotation_press import KeyRerotationPress
+from kvpress.presses.logitkv_press import LogitKVPress
 from kvpress.presses.observed_attention_press import ObservedAttentionPress
 from kvpress.presses.per_layer_compression_press import PerLayerCompressionPress
 
@@ -181,13 +182,21 @@ class KVPressTextGenerationPipeline(Pipeline):
                 cache = DynamicCacheSplitHeadFlatten()
             else:
                 cache = DynamicCache()
-        with press(self.model) if press is not None else contextlib.nullcontext():
-            self.model(
+        if isinstance(press, LogitKVPress):
+            press.prefill(
+                model=self.model,
                 input_ids=context_ids,
-                past_key_values=cache,
+                cache=cache,
                 output_attentions=self.output_attentions(press),
-                logits_to_keep=1,
             )
+        else:
+            with press(self.model) if press is not None else contextlib.nullcontext():
+                self.model(
+                    input_ids=context_ids,
+                    past_key_values=cache,
+                    output_attentions=self.output_attentions(press),
+                    logits_to_keep=1,
+                )
 
         logger.debug(f"Context Length: {context_length}")
         logger.debug(f"Compressed Context Length: {cache.get_seq_length()}")
@@ -207,6 +216,8 @@ class KVPressTextGenerationPipeline(Pipeline):
 
     def output_attentions(self, press: BasePress):
         if isinstance(press, ObservedAttentionPress):
+            return True
+        if isinstance(press, LogitKVPress) and isinstance(press.press, ObservedAttentionPress):
             return True
         if isinstance(press, (KeyRerotationPress, PerLayerCompressionPress)) and isinstance(
             press.press, ObservedAttentionPress
