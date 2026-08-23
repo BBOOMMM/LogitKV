@@ -8,6 +8,7 @@ from transformers import DynamicCache, LlamaConfig, LlamaForCausalLM
 from kvpress.presses.logitkv_press import (
     LogitKVPress,
     assert_root_squared_ranking,
+    coupled_fisher_quadratic_sensitivity,
     fisher_rms_sensitivity,
 )
 from kvpress.presses.snapkv_press import SnapKVPress
@@ -23,6 +24,7 @@ class DummyAttention(nn.Module):
             hidden_size=hidden_size,
         )
         self.head_dim = head_dim
+        self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
 
 
@@ -47,6 +49,60 @@ def test_fisher_rms_matches_explicit_vwo_reference_with_gqa():
     expected = torch.sqrt(explicit_q.clamp_min(0.0) + fisher_eps)
 
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+def test_coupled_fisher_modes_match_explicit_attention_reference_with_gqa():
+    torch.manual_seed(11)
+    batch_size, num_heads, num_kv_heads = 2, 4, 2
+    total_length, window, head_dim = 7, 3, 2
+    module = DummyAttention(num_heads, num_kv_heads, head_dim)
+    keys = torch.randn(batch_size, num_kv_heads, total_length, head_dim)
+    values = torch.randn_like(keys)
+    hidden_states = torch.randn(batch_size, window, num_heads * head_dim)
+    output_grad = torch.randn_like(hidden_states)
+    position_embeddings = (
+        torch.ones(batch_size, window, head_dim),
+        torch.zeros(batch_size, window, head_dim),
+    )
+
+    query_states = module.q_proj(hidden_states).view(batch_size, window, num_heads, head_dim).transpose(1, 2)
+    repeated_keys = keys.repeat_interleave(num_heads // num_kv_heads, dim=1)
+    attention_logits = torch.einsum("bhwd,bhkd->bhwk", query_states, repeated_keys) / head_dim**0.5
+    key_positions = torch.arange(total_length)
+    query_positions = total_length - window + torch.arange(window)
+    causal_mask = key_positions.unsqueeze(0) > query_positions.unsqueeze(1)
+    attention_logits.masked_fill_(causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+    attention = torch.softmax(attention_logits, dim=-1)
+
+    repeated_values = values.repeat_interleave(num_heads // num_kv_heads, dim=1)
+    projection = module.o_proj.weight.transpose(0, 1).reshape(num_heads, head_dim, -1)
+    explicit_vwo = torch.einsum("bhkd,hdm->bhkm", repeated_values, projection)
+    dot = torch.einsum("bhkm,bwm->bhkw", explicit_vwo, output_grad)
+    contribution = attention.transpose(-1, -2) * dot
+    contribution = contribution.reshape(
+        batch_size,
+        num_kv_heads,
+        num_heads // num_kv_heads,
+        total_length,
+        window,
+    ).sum(dim=2)
+
+    expected = {
+        "coupled_diag": contribution.square().sum(dim=-1),
+        "coupled_full": contribution.sum(dim=-1).square(),
+    }
+    for mode, expected_quadratic in expected.items():
+        actual = coupled_fisher_quadratic_sensitivity(
+            keys,
+            values,
+            hidden_states,
+            position_embeddings,
+            output_grad,
+            module,
+            mode,
+            window,
+        )
+        torch.testing.assert_close(actual, expected_quadratic, rtol=1e-5, atol=1e-6)
 
 
 def test_multiple_fisher_labels_average_quadratics_before_root():
@@ -83,6 +139,63 @@ def test_multiple_fisher_labels_average_quadratics_before_root():
     expected_scores = (base_scores + press.attention_eps) * torch.sqrt(expected_quadratic + press.fisher_eps)
     torch.testing.assert_close(press._scores[0], expected_scores)
     assert press._gradient_counts[0] == press._fisher_probe_count
+
+
+def test_coupled_modes_average_quadratics_without_multiplying_base_attention():
+    base_scores = torch.tensor([[[100.0, 0.01]]])
+    first_quadratic = torch.tensor([[[1.0, 9.0]]])
+    second_quadratic = torch.tensor([[[9.0, 1.0]]])
+    expected_quadratic = (first_quadratic + second_quadratic) / 2
+
+    for mode in ("coupled_diag", "coupled_full"):
+        press = LogitKVPress(
+            SnapKVPress(compression_ratio=0.5),
+            fisher_window=4,
+            fisher_positions=1,
+            fisher_labels=2,
+            score_mode=mode,
+            fisher_eps=1e-12,
+            sanity_check=False,
+        )
+        press._states[0] = SimpleNamespace(
+            keys=torch.empty(1, 1, 2, 1),
+            values=torch.empty(1, 1, 2, 1),
+            hidden_states=torch.empty(1, press.fisher_window, 1),
+            position_embeddings=(torch.empty(1), torch.empty(1)),
+            module=SimpleNamespace(layer_idx=0),
+            base_scores=base_scores,
+        )
+        press._total_length = 2
+        press._profile_values = {"score_seconds": 0.0}
+        hook = press._make_gradient_hook(0)
+
+        with patch(
+            "kvpress.presses.logitkv_press.coupled_fisher_quadratic_sensitivity",
+            side_effect=[first_quadratic.clone(), second_quadratic.clone()],
+        ):
+            hook(torch.zeros(1, press.fisher_window, 1))
+            hook(torch.zeros(1, press.fisher_window, 1))
+
+        torch.testing.assert_close(
+            press._scores[0],
+            torch.sqrt(expected_quadratic + press.fisher_eps),
+        )
+
+
+def test_score_mode_validation_rejects_invalid_mode_and_coupled_attention_epsilon():
+    try:
+        LogitKVPress(SnapKVPress(), score_mode="unknown")
+    except ValueError as error:
+        assert "score_mode" in str(error)
+    else:
+        raise AssertionError("Invalid score mode was accepted")
+
+    try:
+        LogitKVPress(SnapKVPress(), score_mode="coupled_diag", attention_eps=1e-4)
+    except ValueError as error:
+        assert "attention_eps" in str(error)
+    else:
+        raise AssertionError("Coupled score mode accepted a nonzero attention_eps")
 
 
 def test_root_and_squared_scores_have_identical_topk_ranking():
@@ -271,6 +384,39 @@ def test_window_aware_snapkv_matches_full_prefill_score():
         )
     window_score = run_and_score(split_cache, input_ids[:, -window:], from_window=True)
     torch.testing.assert_close(window_score, full_score, rtol=1e-5, atol=1e-6)
+
+
+def test_coupled_score_modes_complete_split_prefill_and_cache_compression_on_cpu():
+    torch.manual_seed(12)
+    config = LlamaConfig(
+        vocab_size=41,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=64,
+    )
+    model = LlamaForCausalLM(config).eval()
+    input_ids = torch.randint(0, config.vocab_size, (1, 32))
+
+    for mode in ("coupled_diag", "coupled_full"):
+        cache = DynamicCache()
+        press = LogitKVPress(
+            SnapKVPress(compression_ratio=0.5, window_size=8, kernel_size=5),
+            fisher_window=8,
+            fisher_positions=1,
+            fisher_labels=1,
+            score_mode=mode,
+            fisher_seed=0,
+        )
+        with torch.inference_mode():
+            outputs = press.prefill(model, input_ids, cache)
+
+        assert outputs.logits.shape == (1, 1, config.vocab_size)
+        assert cache.get_seq_length() == 16
+        assert press.last_profile["score_mode"] == mode
+        assert press.last_ranking_check_passed is True
 
 
 def test_128_token_prefill_and_compressed_cache_decode_on_cpu():

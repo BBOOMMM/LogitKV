@@ -6,17 +6,24 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass, field
+from typing import Literal
 
 import torch
 from torch import nn
 from transformers import DynamicCache, PreTrainedModel, QuantizedCache
+from transformers.models.llama.modeling_llama import rotate_half
 
 from kvpress.presses.base_press import BasePress
 from kvpress.presses.scorer_press import ScorerPress
+from kvpress.utils import get_prerope_query_states
 
 logger = logging.getLogger(__name__)
+
+LogitKVScoreMode = Literal["separable", "coupled_diag", "coupled_full"]
+LOGITKV_SCORE_MODES = ("separable", "coupled_diag", "coupled_full")
 
 
 def _output_projection_by_head(module: nn.Module) -> torch.Tensor:
@@ -123,6 +130,112 @@ def fisher_rms_sensitivity(
     return torch.sqrt(quadratic.clamp_min(0.0) + fisher_eps)
 
 
+def coupled_fisher_quadratic_sensitivity(
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    output_grad: torch.Tensor,
+    module: nn.Module,
+    mode: Literal["coupled_diag", "coupled_full"],
+    fisher_window: int = 32,
+) -> torch.Tensor:
+    """Compute an attention-gradient-coupled empirical-Fisher quadratic.
+
+    For a KV token ``i`` shared by a group of query heads, define its
+    value-path contribution at observation-window position ``t`` as
+
+    ``c[t, i] = sum_h A[h, t, i] * g[t]^T (V[i] W_O[h])``.
+
+    ``coupled_diag`` returns ``sum_t c[t, i]^2`` (a position-diagonal
+    approximation), while ``coupled_full`` returns ``(sum_t c[t, i])^2``.
+    Query heads sharing a KV head are summed before squaring because evicting
+    one KV token removes their contributions jointly.
+
+    The computation streams over KV/query heads. It therefore never retains a
+    full ``[batch, heads, window, context]`` attention tensor.
+    """
+
+    if mode not in ("coupled_diag", "coupled_full"):
+        raise ValueError(f"Unsupported coupled LogitKV score mode: {mode}")
+    if keys.ndim != 4 or values.ndim != 4:
+        raise ValueError("keys and values must be rank 4")
+    if keys.shape != values.shape:
+        raise ValueError(f"keys and values must have identical shapes, got {keys.shape} and {values.shape}")
+    if hidden_states.ndim != 3 or output_grad.ndim != 3:
+        raise ValueError("hidden_states and output_grad must be rank 3")
+    if fisher_window <= 0:
+        raise ValueError("fisher_window must be positive")
+    if not isinstance(position_embeddings, (tuple, list)) or len(position_embeddings) != 2:
+        raise ValueError("position_embeddings must be a (cos, sin) pair")
+
+    batch_size, num_kv_heads, total_length, head_dim = values.shape
+    if hidden_states.shape[0] != batch_size or output_grad.shape[0] != batch_size:
+        raise ValueError("keys, values, hidden_states, and output_grad must have the same batch size")
+    if hidden_states.shape[1] == 0 or output_grad.shape[1] == 0:
+        raise ValueError("hidden_states and output_grad must contain at least one token")
+    if module.head_dim != head_dim:
+        raise ValueError(f"Value head dimension {head_dim} does not match module.head_dim {module.head_dim}")
+
+    num_heads = module.config.num_attention_heads
+    if num_heads % num_kv_heads != 0:
+        raise ValueError(f"{num_heads} attention heads cannot be grouped into {num_kv_heads} KV heads")
+    num_key_value_groups = num_heads // num_kv_heads
+    window = min(fisher_window, hidden_states.shape[1], output_grad.shape[1])
+    if total_length < window:
+        raise ValueError(f"Cache length {total_length} is shorter than coupled Fisher window {window}")
+
+    hidden_window = hidden_states[:, -window:]
+    grad_window = output_grad[:, -window:]
+    query_states = get_prerope_query_states(module, hidden_window)
+    cos, sin = position_embeddings
+    cos = cos[:, -window:].to(device=query_states.device, dtype=query_states.dtype)
+    sin = sin[:, -window:].to(device=query_states.device, dtype=query_states.dtype)
+    query_states = (query_states * cos.unsqueeze(1)) + (rotate_half(query_states) * sin.unsqueeze(1))
+
+    output_projection = _output_projection_by_head(module)
+    prefix_length = total_length - window
+    key_positions = torch.arange(total_length, device=query_states.device)
+    query_positions = prefix_length + torch.arange(window, device=query_states.device)
+    causal_mask = key_positions.unsqueeze(0) > query_positions.unsqueeze(1)
+    scale = 1.0 / math.sqrt(head_dim)
+
+    quadratic_by_kv_head = []
+    for kv_head_idx in range(num_kv_heads):
+        head_values = values[:, kv_head_idx]
+        head_keys = keys[:, kv_head_idx]
+        # [batch, context, window]. Accumulating in float32 keeps cancellation
+        # in coupled_full and small diagonal contributions numerically stable.
+        position_contribution = torch.zeros(
+            batch_size,
+            total_length,
+            window,
+            device=values.device,
+            dtype=torch.float32,
+        )
+        first_query_head = kv_head_idx * num_key_value_groups
+        for head_idx in range(first_query_head, first_query_head + num_key_value_groups):
+            query_head = query_states[:, head_idx]
+            attention_logits = torch.matmul(query_head, head_keys.transpose(-1, -2)) * scale
+            attention_logits.masked_fill_(causal_mask.unsqueeze(0), float("-inf"))
+            attention_weights = torch.softmax(attention_logits, dim=-1, dtype=torch.float32)
+
+            head_projection = output_projection[head_idx].to(device=grad_window.device, dtype=grad_window.dtype)
+            grad_head = torch.matmul(grad_window, head_projection.transpose(-1, -2))
+            dot = torch.matmul(
+                head_values.to(device=grad_head.device, dtype=grad_head.dtype),
+                grad_head.transpose(-1, -2),
+            )
+            position_contribution.add_(attention_weights.transpose(-1, -2) * dot.float())
+
+        if mode == "coupled_diag":
+            quadratic_by_kv_head.append(position_contribution.square().sum(dim=-1))
+        else:
+            quadratic_by_kv_head.append(position_contribution.sum(dim=-1).square())
+
+    return torch.stack(quadratic_by_kv_head, dim=1)
+
+
 def assert_root_squared_ranking(
     base_scores: torch.Tensor,
     fisher_quadratic: torch.Tensor,
@@ -184,6 +297,8 @@ class _LayerState:
     keys: torch.Tensor
     values: torch.Tensor
     base_scores: torch.Tensor
+    hidden_states: torch.Tensor | None = None
+    position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 @dataclass
@@ -193,14 +308,17 @@ class LogitKVPress(BasePress):
     The context is split into a detached no-grad prefix and a differentiable
     trailing Fisher window. ``fisher_positions`` trailing logit positions each
     draw ``fisher_labels`` independent labels. Their per-layer Fisher quadratic
-    forms are averaged before the square root. The full cache is then compressed
-    with CriticalKV's Stage-1 safeguard and per-head Top-K rule.
+    forms are averaged before the square root. ``score_mode`` selects the legacy
+    separable attention-times-Fisher score or one of two position-wise coupled
+    formulations. The full cache is then compressed with CriticalKV's Stage-1
+    safeguard and per-head Top-K rule.
     """
 
     press: ScorerPress
     fisher_window: int = 32
     fisher_positions: int = 1
     fisher_labels: int = 1
+    score_mode: LogitKVScoreMode = "separable"
     first_stage_ratio: float = 0.5
     attention_eps: float = 0.0
     fisher_eps: float = 1e-12
@@ -219,12 +337,13 @@ class LogitKVPress(BasePress):
     last_sampled_token_ids: torch.Tensor | None = field(default=None, init=False, repr=False)
     last_ranking_check_passed: bool | None = field(default=None, init=False, repr=False)
     last_full_cache_length: int | None = field(default=None, init=False, repr=False)
-    last_profile: dict[str, float | int] = field(default_factory=dict, init=False, repr=False)
+    last_profile: dict[str, float | int | str] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self):
         if not isinstance(self.press, ScorerPress):
             raise TypeError("LogitKVPress requires a ScorerPress as input")
         self._validate_fisher_configuration()
+        self._validate_score_mode()
         if not 0 <= self.first_stage_ratio <= 1:
             raise ValueError("first_stage_ratio must be between 0 and 1")
         if self.attention_eps < 0:
@@ -246,6 +365,12 @@ class LogitKVPress(BasePress):
         if self.fisher_labels <= 0:
             raise ValueError("fisher_labels must be positive")
 
+    def _validate_score_mode(self) -> None:
+        if self.score_mode not in LOGITKV_SCORE_MODES:
+            raise ValueError(f"score_mode must be one of {', '.join(LOGITKV_SCORE_MODES)}, got {self.score_mode!r}")
+        if self.score_mode != "separable" and self.attention_eps != 0:
+            raise ValueError("attention_eps must be 0 for coupled LogitKV score modes")
+
     @property
     def compression_ratio(self) -> float:
         return self.press.compression_ratio
@@ -264,9 +389,7 @@ class LogitKVPress(BasePress):
         if isinstance(cache, QuantizedCache):
             raise NotImplementedError("LogitKV does not yet support QuantizedCache")
         if not isinstance(cache, DynamicCache):
-            raise NotImplementedError(
-                f"LogitKV currently requires DynamicCache, got {cache.__class__.__name__}"
-            )
+            raise NotImplementedError(f"LogitKV currently requires DynamicCache, got {cache.__class__.__name__}")
         if layer_idx >= len(cache.layers):
             raise RuntimeError(f"Cache layer {layer_idx} is not initialized")
         cache_layer = cache.layers[layer_idx]
@@ -319,15 +442,22 @@ class LogitKVPress(BasePress):
                     kwargs,
                 ).float()
 
+        coupled_hidden_states = None
+        coupled_position_embeddings = None
+        if self.score_mode != "separable":
+            position_embeddings = kwargs.get("position_embeddings")
+            if not isinstance(position_embeddings, (tuple, list)) or len(position_embeddings) != 2:
+                raise ValueError("Coupled LogitKV requires attention position_embeddings=(cos, sin)")
+            coupled_hidden_states = hidden_states.detach()
+            coupled_position_embeddings = tuple(embedding.detach() for embedding in position_embeddings)
+
         layer_output = output[0]
         if not layer_output.requires_grad:
             raise RuntimeError("Window attention output is not differentiable")
 
         expected_shape = keys.shape[:3]
         if base_scores.shape != expected_shape:
-            raise ValueError(
-                f"Base scorer returned {tuple(base_scores.shape)} for cache shape {tuple(expected_shape)}"
-            )
+            raise ValueError(f"Base scorer returned {tuple(base_scores.shape)} for cache shape {tuple(expected_shape)}")
         if not torch.isfinite(base_scores).all():
             raise FloatingPointError(f"Base scorer produced non-finite values at layer {layer_idx}")
         if (base_scores < 0).any():
@@ -339,6 +469,8 @@ class LogitKVPress(BasePress):
             keys=keys,
             values=values,
             base_scores=base_scores,
+            hidden_states=coupled_hidden_states,
+            position_embeddings=coupled_position_embeddings,
         )
         self._gradient_handles.append(layer_output.register_hook(self._make_gradient_hook(layer_idx)))
         return output
@@ -355,9 +487,7 @@ class LogitKVPress(BasePress):
         """Sample Fisher labels independently at each trailing probe position."""
 
         if logits.shape[1] < self.fisher_positions:
-            raise ValueError(
-                f"Need {self.fisher_positions} trailing logits for Fisher probes, got {logits.shape[1]}"
-            )
+            raise ValueError(f"Need {self.fisher_positions} trailing logits for Fisher probes, got {logits.shape[1]}")
         probe_logits = logits[:, -self.fisher_positions :, :].float()
         if not probe_logits.requires_grad:
             raise RuntimeError(
@@ -414,12 +544,26 @@ class LogitKVPress(BasePress):
             self._sync_for_profile(output_grad.device)
             started_at = time.perf_counter()
             with torch.no_grad():
-                fisher_quadratic = fisher_quadratic_sensitivity(
-                    values=state.values,
-                    output_grad=output_grad,
-                    module=state.module,
-                    fisher_window=self.fisher_window,
-                )
+                if self.score_mode == "separable":
+                    fisher_quadratic = fisher_quadratic_sensitivity(
+                        values=state.values,
+                        output_grad=output_grad,
+                        module=state.module,
+                        fisher_window=self.fisher_window,
+                    )
+                else:
+                    if state.hidden_states is None or state.position_embeddings is None:
+                        raise RuntimeError(f"Layer {layer_idx} is missing coupled LogitKV attention state")
+                    fisher_quadratic = coupled_fisher_quadratic_sensitivity(
+                        keys=state.keys,
+                        values=state.values,
+                        hidden_states=state.hidden_states,
+                        position_embeddings=state.position_embeddings,
+                        output_grad=output_grad,
+                        module=state.module,
+                        mode=self.score_mode,
+                        fisher_window=self.fisher_window,
+                    )
                 if layer_idx not in self._quadratic_sums:
                     self._quadratic_sums[layer_idx] = fisher_quadratic
                     self._gradient_counts[layer_idx] = 1
@@ -439,15 +583,22 @@ class LogitKVPress(BasePress):
                 if gradient_count == self._fisher_probe_count:
                     fisher_quadratic_mean = self._quadratic_sums[layer_idx] / self._fisher_probe_count
                     fisher_rms = torch.sqrt(fisher_quadratic_mean.clamp_min(0.0) + self.fisher_eps)
-                    attention_scores = state.base_scores + self.attention_eps
-                    scores = attention_scores * fisher_rms
+                    if self.score_mode == "separable":
+                        ranking_base = state.base_scores + self.attention_eps
+                        scores = ranking_base * fisher_rms
+                    else:
+                        # Attention is already coupled position-wise inside Q.
+                        # Multiplying by the aggregated SnapKV score again would
+                        # double-count attention.
+                        ranking_base = torch.ones_like(fisher_quadratic_mean)
+                        scores = fisher_rms
                     if not torch.isfinite(scores).all():
                         raise FloatingPointError(f"LogitKV produced non-finite scores at layer {layer_idx}")
 
                     n_kept = int(self._total_length * (1 - self.compression_ratio))
                     if self.sanity_check:
                         layer_ranking_check_passed = assert_root_squared_ranking(
-                            attention_scores,
+                            ranking_base,
                             fisher_quadratic_mean,
                             n_kept,
                             self.fisher_eps,
@@ -532,6 +683,7 @@ class LogitKVPress(BasePress):
         if cache.get_seq_length() != 0:
             raise ValueError("LogitKV prefill requires an empty DynamicCache")
         self._validate_fisher_configuration()
+        self._validate_score_mode()
         if self.attention_eps < 0:
             raise ValueError("attention_eps must be non-negative")
 
@@ -540,9 +692,7 @@ class LogitKVPress(BasePress):
         position_ids = self._normal_tensor(position_ids)
         total_length = input_ids.shape[1]
         if total_length <= self.fisher_window:
-            raise ValueError(
-                f"Context length {total_length} must be greater than fisher_window {self.fisher_window}"
-            )
+            raise ValueError(f"Context length {total_length} must be greater than fisher_window {self.fisher_window}")
         prefix_length = total_length - self.fisher_window
         prefix_ids = input_ids[:, :prefix_length]
         window_ids = input_ids[:, prefix_length:]
@@ -651,6 +801,7 @@ class LogitKVPress(BasePress):
                 "fisher_positions": self.fisher_positions,
                 "fisher_labels": self.fisher_labels,
                 "fisher_probe_count": self._fisher_probe_count,
+                "score_mode": self.score_mode,
                 "total_seconds": time.perf_counter() - total_started_at,
             }
             if self.profile and device.type == "cuda":

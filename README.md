@@ -125,8 +125,17 @@ LogitKV uses a detached no-grad prefix and runs Fisher backward only on its trai
 `fisher_window`. `fisher_labels` independently samples that many labels at each
 position. LogitKV averages all position-label Fisher quadratic forms before the
 square root.
-LogitKV Stage 2 uses `(attention_score + attention_eps) * fisher_rms`, with
-`attention_eps=0` by default; nonzero values are available for ablation.
+`score_mode` selects one of three Stage-2 formulations:
+
+- `separable` (default) uses `(attention_score + attention_eps) * fisher_rms` and
+  reproduces the existing LogitKV v2 score.
+- `coupled_diag` sums squared position-wise contributions
+  `A[t,i] * (g[t]^T V[i] W_O)`.
+- `coupled_full` sums the position-wise contributions first and then squares.
+
+The coupled modes already contain attention inside their Fisher quadratic, so
+they use `sqrt(Q + fisher_eps)` directly and require `attention_eps=0`. All modes
+retain the same attention-only Stage-1 safeguard.
 For direct model calls, use `press.prefill(model, input_ids, cache)` instead of the
 ordinary `with press(model)` API.
 

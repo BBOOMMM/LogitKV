@@ -109,6 +109,7 @@ def evaluate(
     fisher_window: int = 32,
     fisher_positions: int = 1,
     fisher_labels: int = 1,
+    score_mode: str = "separable",
     fisher_seed: int = 42,
     attention_eps: float = 0.0,
     fraction: float = 0.2,
@@ -139,6 +140,8 @@ def evaluate(
         Number of trailing logit positions used by LogitKV, by default 1
     fisher_labels : int, optional
         Number of independently sampled labels per LogitKV probe position, by default 1
+    score_mode : str, optional
+        LogitKV Stage-2 score: separable, coupled_diag, or coupled_full, by default separable
     fisher_seed : int, optional
         Sampling seed for LogitKV's Fisher probes, by default 42
     attention_eps : float, optional
@@ -167,10 +170,13 @@ def evaluate(
             assert fisher_window > 0, "fisher_window must be positive"
             assert 0 < fisher_positions <= fisher_window, "fisher_positions must be in [1, fisher_window]"
             assert fisher_labels > 0, "fisher_labels must be positive"
+            assert score_mode in ("separable", "coupled_diag", "coupled_full"), "invalid LogitKV score_mode"
             assert attention_eps >= 0, "attention_eps must be non-negative"
+            assert score_mode == "separable" or attention_eps == 0, "coupled score modes require attention_eps=0"
             press.fisher_window = fisher_window
             press.fisher_positions = fisher_positions
             press.fisher_labels = fisher_labels
+            press.score_mode = score_mode
             press.fisher_seed = fisher_seed
             press.attention_eps = attention_eps
     else:
@@ -193,6 +199,7 @@ def evaluate(
                 f"fw{fisher_window}",
                 f"positions{fisher_positions}",
                 f"labels{fisher_labels}",
+                f"mode{score_mode}",
                 f"fs{fisher_seed}",
                 f"ae{attention_eps:g}",
             ]
