@@ -134,8 +134,12 @@ square root.
 - `coupled_full` sums the position-wise contributions first and then squares.
 
 The coupled modes already contain attention inside their Fisher quadratic, so
-they use `sqrt(Q + fisher_eps)` directly and require `attention_eps=0`. All modes
-retain the same attention-only Stage-1 safeguard.
+they rank directly by `Q.clamp_min(0)` without a square root or `fisher_eps`, and
+require `attention_eps=0`. This avoids flattening their much smaller quadratic
+values into FP32 ties. `coupled_kernel_size` optionally applies an odd-width
+`avg_pool1d` across neighboring KV positions before Top-K; its default `1`
+disables pooling, while `5` matches SnapKV's default neighborhood width. All
+modes retain the same attention-only Stage-1 safeguard.
 For direct model calls, use `press.prefill(model, input_ids, cache)` instead of the
 ordinary `with press(model)` API.
 

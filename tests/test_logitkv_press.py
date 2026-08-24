@@ -141,7 +141,7 @@ def test_multiple_fisher_labels_average_quadratics_before_root():
     assert press._gradient_counts[0] == press._fisher_probe_count
 
 
-def test_coupled_modes_average_quadratics_without_multiplying_base_attention():
+def test_coupled_modes_rank_by_average_quadratic_without_attention_or_root():
     base_scores = torch.tensor([[[100.0, 0.01]]])
     first_quadratic = torch.tensor([[[1.0, 9.0]]])
     second_quadratic = torch.tensor([[[9.0, 1.0]]])
@@ -155,7 +155,7 @@ def test_coupled_modes_average_quadratics_without_multiplying_base_attention():
             fisher_labels=2,
             score_mode=mode,
             fisher_eps=1e-12,
-            sanity_check=False,
+            sanity_check=True,
         )
         press._states[0] = SimpleNamespace(
             keys=torch.empty(1, 1, 2, 1),
@@ -169,17 +169,51 @@ def test_coupled_modes_average_quadratics_without_multiplying_base_attention():
         press._profile_values = {"score_seconds": 0.0}
         hook = press._make_gradient_hook(0)
 
-        with patch(
-            "kvpress.presses.logitkv_press.coupled_fisher_quadratic_sensitivity",
-            side_effect=[first_quadratic.clone(), second_quadratic.clone()],
+        with (
+            patch(
+                "kvpress.presses.logitkv_press.coupled_fisher_quadratic_sensitivity",
+                side_effect=[first_quadratic.clone(), second_quadratic.clone()],
+            ),
+            patch("kvpress.presses.logitkv_press.assert_root_squared_ranking") as ranking_check,
         ):
             hook(torch.zeros(1, press.fisher_window, 1))
             hook(torch.zeros(1, press.fisher_window, 1))
 
-        torch.testing.assert_close(
-            press._scores[0],
-            torch.sqrt(expected_quadratic + press.fisher_eps),
-        )
+        torch.testing.assert_close(press._scores[0], expected_quadratic, rtol=0, atol=0)
+        ranking_check.assert_not_called()
+        assert press.last_ranking_check_passed is True
+
+
+def test_coupled_kernel_pooling_spreads_quadratic_scores_to_neighbors():
+    press = LogitKVPress(
+        SnapKVPress(compression_ratio=0.4),
+        fisher_window=4,
+        fisher_positions=1,
+        fisher_labels=1,
+        score_mode="coupled_diag",
+        coupled_kernel_size=3,
+        sanity_check=False,
+    )
+    press._states[0] = SimpleNamespace(
+        keys=torch.empty(1, 1, 5, 1),
+        values=torch.empty(1, 1, 5, 1),
+        hidden_states=torch.empty(1, press.fisher_window, 1),
+        position_embeddings=(torch.empty(1), torch.empty(1)),
+        module=SimpleNamespace(layer_idx=0),
+        base_scores=torch.zeros(1, 1, 5),
+    )
+    press._total_length = 5
+    press._profile_values = {"score_seconds": 0.0}
+    quadratic = torch.tensor([[[0.0, 0.0, 9.0, 0.0, 0.0]]])
+
+    with patch(
+        "kvpress.presses.logitkv_press.coupled_fisher_quadratic_sensitivity",
+        return_value=quadratic,
+    ):
+        press._make_gradient_hook(0)(torch.zeros(1, press.fisher_window, 1))
+
+    expected = torch.tensor([[[0.0, 3.0, 3.0, 3.0, 0.0]]])
+    torch.testing.assert_close(press._scores[0], expected, rtol=0, atol=0)
 
 
 def test_score_mode_validation_rejects_invalid_mode_and_coupled_attention_epsilon():
@@ -196,6 +230,25 @@ def test_score_mode_validation_rejects_invalid_mode_and_coupled_attention_epsilo
         assert "attention_eps" in str(error)
     else:
         raise AssertionError("Coupled score mode accepted a nonzero attention_eps")
+
+    for invalid_kernel_size in (0, 2):
+        try:
+            LogitKVPress(
+                SnapKVPress(),
+                score_mode="coupled_diag",
+                coupled_kernel_size=invalid_kernel_size,
+            )
+        except ValueError as error:
+            assert "coupled_kernel_size" in str(error)
+        else:
+            raise AssertionError("Invalid coupled kernel size was accepted")
+
+    try:
+        LogitKVPress(SnapKVPress(), score_mode="separable", coupled_kernel_size=3)
+    except ValueError as error:
+        assert "only applies" in str(error)
+    else:
+        raise AssertionError("Separable mode accepted coupled pooling")
 
 
 def test_root_and_squared_scores_have_identical_topk_ranking():
@@ -416,6 +469,7 @@ def test_coupled_score_modes_complete_split_prefill_and_cache_compression_on_cpu
         assert outputs.logits.shape == (1, 1, config.vocab_size)
         assert cache.get_seq_length() == 16
         assert press.last_profile["score_mode"] == mode
+        assert press.last_profile["coupled_kernel_size"] == 1
         assert press.last_ranking_check_passed is True
 
 

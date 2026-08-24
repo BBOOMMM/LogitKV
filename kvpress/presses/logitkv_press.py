@@ -13,6 +13,7 @@ from typing import Literal
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 from transformers import DynamicCache, PreTrainedModel, QuantizedCache
 from transformers.models.llama.modeling_llama import rotate_half
 
@@ -310,8 +311,9 @@ class LogitKVPress(BasePress):
     draw ``fisher_labels`` independent labels. Their per-layer Fisher quadratic
     forms are averaged before the square root. ``score_mode`` selects the legacy
     separable attention-times-Fisher score or one of two position-wise coupled
-    formulations. The full cache is then compressed with CriticalKV's Stage-1
-    safeguard and per-head Top-K rule.
+    formulations. Coupled scores can optionally be smoothed across neighboring
+    KV positions with ``coupled_kernel_size``. The full cache is then compressed
+    with CriticalKV's Stage-1 safeguard and per-head Top-K rule.
     """
 
     press: ScorerPress
@@ -319,6 +321,7 @@ class LogitKVPress(BasePress):
     fisher_positions: int = 1
     fisher_labels: int = 1
     score_mode: LogitKVScoreMode = "separable"
+    coupled_kernel_size: int = 1
     first_stage_ratio: float = 0.5
     attention_eps: float = 0.0
     fisher_eps: float = 1e-12
@@ -370,6 +373,10 @@ class LogitKVPress(BasePress):
             raise ValueError(f"score_mode must be one of {', '.join(LOGITKV_SCORE_MODES)}, got {self.score_mode!r}")
         if self.score_mode != "separable" and self.attention_eps != 0:
             raise ValueError("attention_eps must be 0 for coupled LogitKV score modes")
+        if self.coupled_kernel_size <= 0 or self.coupled_kernel_size % 2 == 0:
+            raise ValueError("coupled_kernel_size must be a positive odd integer")
+        if self.score_mode == "separable" and self.coupled_kernel_size != 1:
+            raise ValueError("coupled_kernel_size only applies to coupled LogitKV score modes")
 
     @property
     def compression_ratio(self) -> float:
@@ -579,24 +586,31 @@ class LogitKVPress(BasePress):
                     )
 
                 # Fisher matrices (and therefore their quadratic forms) are
-                # averaged before applying the square root.
+                # averaged before applying the score-mode-specific transform.
                 if gradient_count == self._fisher_probe_count:
                     fisher_quadratic_mean = self._quadratic_sums[layer_idx] / self._fisher_probe_count
-                    fisher_rms = torch.sqrt(fisher_quadratic_mean.clamp_min(0.0) + self.fisher_eps)
                     if self.score_mode == "separable":
+                        fisher_rms = torch.sqrt(fisher_quadratic_mean.clamp_min(0.0) + self.fisher_eps)
                         ranking_base = state.base_scores + self.attention_eps
                         scores = ranking_base * fisher_rms
                     else:
                         # Attention is already coupled position-wise inside Q.
-                        # Multiplying by the aggregated SnapKV score again would
-                        # double-count attention.
-                        ranking_base = torch.ones_like(fisher_quadratic_mean)
-                        scores = fisher_rms
+                        # Rank directly by Q: sqrt and a fixed epsilon are
+                        # mathematically unnecessary here and collapse tiny
+                        # coupled values into large FP32 tie groups.
+                        scores = fisher_quadratic_mean.clamp_min(0.0)
+                        if self.coupled_kernel_size > 1:
+                            scores = F.avg_pool1d(
+                                scores,
+                                kernel_size=self.coupled_kernel_size,
+                                stride=1,
+                                padding=self.coupled_kernel_size // 2,
+                            )
                     if not torch.isfinite(scores).all():
                         raise FloatingPointError(f"LogitKV produced non-finite scores at layer {layer_idx}")
 
                     n_kept = int(self._total_length * (1 - self.compression_ratio))
-                    if self.sanity_check:
+                    if self.sanity_check and self.score_mode == "separable":
                         layer_ranking_check_passed = assert_root_squared_ranking(
                             ranking_base,
                             fisher_quadratic_mean,
@@ -609,6 +623,10 @@ class LogitKVPress(BasePress):
                             self.last_ranking_check_passed = layer_ranking_check_passed
                         else:
                             self.last_ranking_check_passed &= layer_ranking_check_passed
+                    elif self.sanity_check:
+                        # Coupled modes use Q itself, so no monotonic score
+                        # transform remains to cross-check.
+                        self.last_ranking_check_passed = True
                     self._scores[layer_idx] = scores.detach()
 
             self._sync_for_profile(output_grad.device)
@@ -802,6 +820,7 @@ class LogitKVPress(BasePress):
                 "fisher_labels": self.fisher_labels,
                 "fisher_probe_count": self._fisher_probe_count,
                 "score_mode": self.score_mode,
+                "coupled_kernel_size": self.coupled_kernel_size,
                 "total_seconds": time.perf_counter() - total_started_at,
             }
             if self.profile and device.type == "cuda":

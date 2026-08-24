@@ -228,6 +228,12 @@ if __name__ == "__main__":
         default="separable",
         help="LogitKV Stage-2 score formulation.",
     )
+    parser.add_argument(
+        "--coupled_kernel_size",
+        type=int,
+        default=1,
+        help="Odd neighborhood-average kernel for coupled Q; 1 disables pooling.",
+    )
     parser.add_argument("--fisher_seed", type=int, default=42, help="LogitKV Fisher sampling seed.")
     parser.add_argument("--attention_eps", type=float, default=0.0, help="LogitKV base-attention stabilizer.")
     args = parser.parse_args()
@@ -247,12 +253,17 @@ if __name__ == "__main__":
             parser.error("--fisher_labels must be positive")
         if args.attention_eps < 0:
             parser.error("--attention_eps must be non-negative")
+        if args.coupled_kernel_size <= 0 or args.coupled_kernel_size % 2 == 0:
+            parser.error("--coupled_kernel_size must be a positive odd integer")
         if args.score_mode != "separable" and args.attention_eps != 0:
             parser.error("coupled --score_mode values require --attention_eps 0")
+        if args.score_mode == "separable" and args.coupled_kernel_size != 1:
+            parser.error("--coupled_kernel_size only applies to coupled --score_mode values")
         press.fisher_window = args.fisher_window
         press.fisher_positions = args.fisher_positions
         press.fisher_labels = args.fisher_labels
         press.score_mode = args.score_mode
+        press.coupled_kernel_size = args.coupled_kernel_size
         press.fisher_seed = args.fisher_seed
         press.attention_eps = args.attention_eps
 
