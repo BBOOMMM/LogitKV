@@ -25,6 +25,8 @@ logger = logging.getLogger(__name__)
 
 LogitKVScoreMode = Literal["separable", "coupled_diag", "coupled_full"]
 LOGITKV_SCORE_MODES = ("separable", "coupled_diag", "coupled_full")
+LogitKVAllocationMode = Literal["uniform", "adaptive"]
+LOGITKV_ALLOCATION_MODES = ("uniform", "adaptive")
 FisherPositionAggregation = Literal["mean", "max"]
 FISHER_POSITION_AGGREGATIONS = ("mean", "max")
 CoupledPooling = Literal["avg", "max"]
@@ -317,7 +319,11 @@ class LogitKVPress(BasePress):
     separable attention-times-Fisher score or one of two position-wise coupled
     formulations. Coupled scores can optionally be smoothed across neighboring
     KV positions with ``coupled_kernel_size``. The full cache is then compressed
-    with CriticalKV's Stage-1 safeguard and per-head Top-K rule.
+    with a Stage-1 safeguard and either a uniform per-head Top-K rule
+    (SnapKV-style) or adaptive head budgets (AdaSnapKV-style). The adaptive
+    variant uses the same mask-based simulation as the existing AdaKV presses
+    because a regular DynamicCache cannot represent different sequence lengths
+    for different KV heads.
     """
 
     press: ScorerPress
@@ -334,6 +340,8 @@ class LogitKVPress(BasePress):
     sanity_check: bool = True
     fisher_seed: int | None = None
     profile: bool = False
+    allocation_mode: LogitKVAllocationMode = "uniform"
+    alpha_safeguard: float = 0.20
 
     _states: dict[int, _LayerState] = field(default_factory=dict, init=False, repr=False)
     _quadratic_sums: dict[int, torch.Tensor] = field(default_factory=dict, init=False, repr=False)
@@ -356,6 +364,13 @@ class LogitKVPress(BasePress):
         self._validate_score_mode()
         if not 0 <= self.first_stage_ratio <= 1:
             raise ValueError("first_stage_ratio must be between 0 and 1")
+        if self.allocation_mode not in LOGITKV_ALLOCATION_MODES:
+            raise ValueError(
+                "allocation_mode must be one of "
+                f"{', '.join(LOGITKV_ALLOCATION_MODES)}, got {self.allocation_mode!r}"
+            )
+        if not 0 <= self.alpha_safeguard <= 1:
+            raise ValueError("alpha_safeguard must be between 0 and 1")
         if self.attention_eps < 0:
             raise ValueError("attention_eps must be non-negative")
         if self.fisher_eps < 0:
@@ -697,6 +712,10 @@ class LogitKVPress(BasePress):
             q_len = keys.shape[2]
             n_kept = int(q_len * (1 - self.compression_ratio))
 
+            if self.allocation_mode == "adaptive":
+                self._set_adaptive_mask(state, scores, n_kept)
+                continue
+
             first_stage_budget = int((1 - self.compression_ratio) * q_len * self.first_stage_ratio)
             if first_stage_budget:
                 top_base_indices = state.base_scores.topk(first_stage_budget, dim=-1, sorted=True).indices
@@ -707,6 +726,64 @@ class LogitKVPress(BasePress):
             cache_layer = state.cache.layers[layer_idx]
             cache_layer.keys = keys.gather(2, gather_indices).contiguous().detach()
             cache_layer.values = values.gather(2, gather_indices).contiguous().detach()
+
+    def _set_adaptive_mask(self, state: _LayerState, scores: torch.Tensor, n_kept: int) -> None:
+        """Select adaptive per-head budgets and store the simulated prune mask.
+
+        ``DynamicCache`` stores one sequence length for all KV heads. AdaKV's
+        head-wise allocation is therefore represented by fake keys during
+        subsequent decoding, just like :class:`AdaKVPress` and
+        :class:`CriticalAdaKVPress`.
+        """
+
+        module = state.module
+        base_scores = state.base_scores
+        batch_size, num_kv_heads, q_len = scores.shape
+        total_budget = n_kept * num_kv_heads
+        if total_budget == 0:
+            module.masked_key_indices = torch.ones_like(scores, dtype=torch.bool).nonzero(as_tuple=True)
+            return
+
+        # Reserve a minimum number of base-attention tokens for every head,
+        # then use the LogitKV scores to allocate the remaining budget across
+        # heads. This mirrors AdaKV's safeguard without consuming any
+        # CriticalKV scores or state.
+        allocation_scores = scores.clone()
+        n_safe = int(n_kept * self.alpha_safeguard)
+        if n_safe:
+            safe_indices = base_scores.topk(n_safe, dim=-1, sorted=True).indices
+            allocation_scores.scatter_(-1, safe_indices, torch.finfo(allocation_scores.dtype).max)
+
+        preliminary_indices = allocation_scores.reshape(batch_size, -1).topk(total_budget, dim=-1).indices
+        preliminary_heads = preliminary_indices // q_len
+        head_budgets = torch.zeros(
+            batch_size, num_kv_heads, dtype=torch.long, device=scores.device
+        )
+        head_budgets.scatter_add_(
+            1,
+            preliminary_heads,
+            torch.ones_like(preliminary_heads, dtype=torch.long),
+        )
+
+        keep_mask = torch.zeros_like(scores, dtype=torch.bool)
+        max_score = torch.finfo(scores.dtype).max
+        for batch_idx in range(batch_size):
+            for head_idx in range(num_kv_heads):
+                head_budget = int(head_budgets[batch_idx, head_idx].item())
+                if head_budget == 0:
+                    continue
+
+                head_scores = scores[batch_idx, head_idx].clone()
+                stage_one_budget = int(head_budget * self.first_stage_ratio)
+                if stage_one_budget:
+                    stage_one_indices = base_scores[batch_idx, head_idx].topk(
+                        stage_one_budget, sorted=True
+                    ).indices
+                    head_scores.scatter_(0, stage_one_indices, max_score)
+                keep_indices = head_scores.topk(head_budget, sorted=True).indices
+                keep_mask[batch_idx, head_idx, keep_indices] = True
+
+        module.masked_key_indices = (~keep_mask).nonzero(as_tuple=True)
 
     def prefill(
         self,
@@ -743,6 +820,13 @@ class LogitKVPress(BasePress):
         self._validate_score_mode()
         if self.attention_eps < 0:
             raise ValueError("attention_eps must be non-negative")
+        if self.allocation_mode not in LOGITKV_ALLOCATION_MODES:
+            raise ValueError(
+                "allocation_mode must be one of "
+                f"{', '.join(LOGITKV_ALLOCATION_MODES)}, got {self.allocation_mode!r}"
+            )
+        if not 0 <= self.alpha_safeguard <= 1:
+            raise ValueError("alpha_safeguard must be between 0 and 1")
 
         input_ids = self._normal_tensor(input_ids)
         attention_mask = self._normal_tensor(attention_mask)
@@ -864,6 +948,8 @@ class LogitKVPress(BasePress):
                 "coupled_kernel_size": self.coupled_kernel_size,
                 "coupled_pooling": self.coupled_pooling,
                 "first_stage_ratio": self.first_stage_ratio,
+                "allocation_mode": self.allocation_mode,
+                "alpha_safeguard": self.alpha_safeguard,
                 "total_seconds": time.perf_counter() - total_started_at,
             }
             if self.profile and device.type == "cuda":

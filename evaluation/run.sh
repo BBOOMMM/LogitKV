@@ -3,8 +3,11 @@ CUDA_VISIBLE_DEVICES=0 python evaluate.py \
   --data_dir "$KVPRESS_DATASETS/ruler/32768" \
   --model "$MODELS_DIR/Meta-Llama-3.1-8B-Instruct" \
   --press_name logit_sanpkv \
+  --fisher_seed 42 \
+  --attention_eps 0 \
+  --device cuda:0 \
   --compression_ratio 0.6 \
-  --fisher_window 32 \
+  --fisher_window 8 \
   --fisher_positions 2 \
   --fisher_labels 2 \
   --fisher_position_aggregation mean \
@@ -12,11 +15,8 @@ CUDA_VISIBLE_DEVICES=0 python evaluate.py \
   --coupled_kernel_size 1 \
   --coupled_pooling avg \
   --first_stage_ratio 0.5 \
-  --fisher_seed 42 \
-  --attention_eps 0 \
-  --device cuda:0 \
   --fraction 0.1 \
-  --snapkv_kernel_size 1 \
+  --snapkv_kernel_size 5 \
   --tasks niah_multikey_2,niah_multikey_3
 
 

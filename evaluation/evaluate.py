@@ -72,7 +72,14 @@ SCORER_DICT = {
 }
 
 PRESS_DICT = {
+    # Keep the legacy name for callers that still use it. The two explicit
+    # names below use independent press instances and are the recommended
+    # configurations for LogitKV-vs-CriticalKV comparisons.
     "logitkv": LogitKVPress(SnapKVPress(), fisher_seed=42),
+    "logit_sanpkv": LogitKVPress(SnapKVPress(), fisher_seed=42),
+    "logit_adasnapkv": LogitKVPress(
+        SnapKVPress(), allocation_mode="adaptive", fisher_seed=42
+    ),
     "criti_adasnapkv": CriticalAdaKVPress(SnapKVPress()),
     "criti_ada_expected_attention": CriticalAdaKVPress(ExpectedAttentionPress(use_vnorm=False)),
     "criti_snapkv": CriticalKVPress(SnapKVPress()),
@@ -265,8 +272,7 @@ def evaluate(
             filename_parts.append(f"ck{coupled_kernel_size}")
             if coupled_pooling != "avg":
                 filename_parts.append(f"cp{coupled_pooling}")
-        if first_stage_ratio != 0.5:
-            filename_parts.append(f"sr{first_stage_ratio:g}")
+        filename_parts.append(f"sr{first_stage_ratio:g}")
         filename_parts.extend([f"fs{fisher_seed}", f"ae{attention_eps:g}"])
     filename_parts.append(f"frac{fraction:.2f}")
     if requested_tasks:

@@ -220,6 +220,30 @@ def test_coupled_modes_rank_by_average_quadratic_without_attention_or_root():
         assert press.last_ranking_check_passed is True
 
 
+def test_adaptive_allocation_sets_headwise_mask_without_criticalkv_state():
+    press = LogitKVPress(
+        SnapKVPress(compression_ratio=0.5),
+        allocation_mode="adaptive",
+        first_stage_ratio=0.0,
+        alpha_safeguard=0.0,
+    )
+    module = SimpleNamespace()
+    state = SimpleNamespace(
+        module=module,
+        base_scores=torch.ones(1, 2, 4),
+    )
+    scores = torch.tensor(
+        [[[10.0, 9.0, 8.0, 7.0], [1.0, 2.0, 3.0, 4.0]]]
+    )
+
+    press._set_adaptive_mask(state, scores, n_kept=2)
+
+    batch_indices, head_indices, seq_indices = module.masked_key_indices
+    assert batch_indices.numel() == 4
+    assert torch.equal(head_indices, torch.ones(4, dtype=torch.long))
+    assert torch.equal(seq_indices, torch.arange(4))
+
+
 def test_coupled_kernel_pooling_spreads_quadratic_scores_to_neighbors():
     press = LogitKVPress(
         SnapKVPress(compression_ratio=0.4),

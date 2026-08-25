@@ -53,7 +53,14 @@ from kvpress import (
 logger = logging.getLogger(__name__)
 
 PRESS_DICT = {
+    # Keep the legacy name for callers that still use it. The two explicit
+    # names below use independent press instances and are the recommended
+    # configurations for LogitKV-vs-CriticalKV comparisons.
     "logitkv": LogitKVPress(SnapKVPress(), fisher_seed=42),
+    "logit_sanpkv": LogitKVPress(SnapKVPress(), fisher_seed=42),
+    "logit_adasnapkv": LogitKVPress(
+        SnapKVPress(), allocation_mode="adaptive", fisher_seed=42
+    ),
     "criti_adasnapkv": CriticalAdaKVPress(SnapKVPress()),
     "criti_ada_expected_attention": CriticalAdaKVPress(ExpectedAttentionPress(use_vnorm=False)),
     "criti_snapkv": CriticalKVPress(SnapKVPress()),

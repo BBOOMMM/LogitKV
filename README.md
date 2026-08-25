@@ -115,7 +115,8 @@ bash efficiency_evaluate.sh
 - `efficient_defensivekv` - DefensiveKV (per-head)
 - `efficient_layer_defensivekv` - GlobalDefensiveKV (global per-head)
 - `criti_adasnapkv` - CriticalKV built on  AdaKV
-- `logitkv` - LogitKV with SnapKV base scores and downstream Fisher sensitivity
+- `logit_sanpkv` - LogitKV with SnapKV base scores and uniform per-head budgets
+- `logit_adasnapkv` - LogitKV with SnapKV base scores and AdaKV-style adaptive head budgets
 - `adasnapkv` - AdaKV
 - `snapkv` - SnapKV
 
