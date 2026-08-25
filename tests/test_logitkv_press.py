@@ -51,6 +51,19 @@ def test_fisher_rms_matches_explicit_vwo_reference_with_gqa():
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
 
 
+def test_fisher_rms_ignores_zero_gradient_positions():
+    torch.manual_seed(1)
+    module = DummyAttention(num_heads=1, num_kv_heads=1, head_dim=3)
+    values = torch.randn(1, 1, 4, 3)
+    output_grad = torch.zeros(1, 4, 3)
+    output_grad[:, 1] = torch.tensor([1.0, -2.0, 0.5])
+
+    actual = fisher_rms_sensitivity(values, output_grad, module, fisher_window=4)
+    expected = fisher_rms_sensitivity(values, output_grad[:, 1:2], module, fisher_window=4)
+
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+
 def test_coupled_fisher_modes_match_explicit_attention_reference_with_gqa():
     torch.manual_seed(11)
     batch_size, num_heads, num_kv_heads = 2, 4, 2

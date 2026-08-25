@@ -7,7 +7,7 @@ CUDA_VISIBLE_DEVICES=0 python evaluate.py \
   --attention_eps 0 \
   --device cuda:0 \
   --compression_ratio 0.6 \
-  --fisher_window 8 \
+  --fisher_window 32 \
   --fisher_positions 2 \
   --fisher_labels 2 \
   --fisher_position_aggregation mean \

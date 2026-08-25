@@ -57,7 +57,13 @@ def fisher_quadratic_sensitivity(
     module: nn.Module,
     fisher_window: int = 32,
 ) -> torch.Tensor:
-    """Compute ``Q = mean_t((g_t^T (V_i W_O))^2)`` without forming ``V W_O``."""
+    """Compute Fisher quadratic sensitivity without forming ``V W_O``.
+
+    The mean is taken only over positions whose output gradient is non-zero.
+    Causal probe logits leave future positions with zero gradients; including
+    those positions in the denominator would incorrectly dilute the Fisher
+    estimate.
+    """
 
     if values.ndim != 4:
         raise ValueError(f"values must be rank 4, got shape {tuple(values.shape)}")
@@ -81,6 +87,8 @@ def fisher_quadratic_sensitivity(
     num_key_value_groups = num_heads // num_kv_heads
     window = min(fisher_window, output_grad.shape[1])
     grad_window = output_grad[:, -window:]
+    valid_positions = grad_window.detach().ne(0).any(dim=-1)
+    valid_counts = valid_positions.sum(dim=-1)
     output_projection = _output_projection_by_head(module)
 
     # Compute each query head separately to avoid the [B, H, K, hidden_size]
@@ -93,7 +101,10 @@ def fisher_quadratic_sensitivity(
         grad_head = torch.matmul(grad_window, head_projection.transpose(-1, -2))
         head_values = values[:, kv_head_idx].to(device=grad_head.device, dtype=grad_head.dtype)
         dot = torch.matmul(head_values, grad_head.transpose(-1, -2))
-        quadratic_by_head.append(dot.float().square().mean(dim=-1))
+        quadratic = dot.float().square()
+        quadratic = quadratic.masked_fill(~valid_positions[:, None, :], 0.0)
+        quadratic = quadratic.sum(dim=-1) / valid_counts.clamp_min(1).unsqueeze(-1)
+        quadratic_by_head.append(quadratic)
 
     quadratic = torch.stack(quadratic_by_head, dim=1)
     return quadratic.reshape(batch_size, num_kv_heads, num_key_value_groups, values.shape[2]).mean(dim=2)
@@ -110,7 +121,7 @@ def fisher_rms_sensitivity(
 
     This evaluates
 
-    ``sqrt(mean_t((g_t^T (V_i W_O))^2) + fisher_eps)``
+    ``sqrt(mean_{t:g_t!=0}((g_t^T (V_i W_O))^2) + fisher_eps)``
 
     without materializing ``V W_O``. For grouped-query attention, the quadratic
     sensitivities of the query heads sharing one KV head are averaged before the
@@ -126,7 +137,9 @@ def fisher_rms_sensitivity(
     module:
         Attention module owning ``o_proj``.
     fisher_window:
-        Number of trailing layer-output positions used for the empirical Fisher.
+        Number of trailing layer-output positions considered for the empirical
+        Fisher. Positions with an all-zero output gradient are excluded from
+        the mean.
     fisher_eps:
         Non-negative stabilizer added to ``Q`` inside the square root.
     """

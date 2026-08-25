@@ -125,7 +125,8 @@ LogitKV uses a detached no-grad prefix and runs Fisher backward only on its trai
 `fisher_positions` selects trailing logit positions and must be between 1 and
 `fisher_window`. `fisher_labels` independently samples that many labels at each
 position. LogitKV averages all position-label Fisher quadratic forms before the
-square root.
+square root, while ignoring causal positions whose output gradient is all zero
+so they do not dilute the average.
 `fisher_position_aggregation=max` keeps the label mean within each position but
 takes the maximum quadratic across positions, preserving KV tokens important to
 any trailing logit probe. The default `mean` retains the Monte Carlo average.
