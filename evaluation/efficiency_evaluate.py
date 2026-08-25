@@ -223,6 +223,12 @@ if __name__ == "__main__":
     parser.add_argument("--fisher_positions", type=int, default=1, help="LogitKV trailing Fisher probe positions.")
     parser.add_argument("--fisher_labels", type=int, default=1, help="Sampled labels per LogitKV probe position.")
     parser.add_argument(
+        "--fisher_position_aggregation",
+        choices=("mean", "max"),
+        default="mean",
+        help="Aggregation across Fisher probe positions.",
+    )
+    parser.add_argument(
         "--score_mode",
         choices=("separable", "coupled_diag", "coupled_full"),
         default="separable",
@@ -233,6 +239,18 @@ if __name__ == "__main__":
         type=int,
         default=1,
         help="Odd neighborhood-average kernel for coupled Q; 1 disables pooling.",
+    )
+    parser.add_argument(
+        "--coupled_pooling",
+        choices=("avg", "max"),
+        default="avg",
+        help="Coupled-Q neighborhood pooling mode.",
+    )
+    parser.add_argument(
+        "--first_stage_ratio",
+        type=float,
+        default=0.5,
+        help="Fraction of retained positions protected by attention-only Stage 1.",
     )
     parser.add_argument("--fisher_seed", type=int, default=42, help="LogitKV Fisher sampling seed.")
     parser.add_argument("--attention_eps", type=float, default=0.0, help="LogitKV base-attention stabilizer.")
@@ -255,15 +273,22 @@ if __name__ == "__main__":
             parser.error("--attention_eps must be non-negative")
         if args.coupled_kernel_size <= 0 or args.coupled_kernel_size % 2 == 0:
             parser.error("--coupled_kernel_size must be a positive odd integer")
+        if not 0 <= args.first_stage_ratio <= 1:
+            parser.error("--first_stage_ratio must be in [0, 1]")
         if args.score_mode != "separable" and args.attention_eps != 0:
             parser.error("coupled --score_mode values require --attention_eps 0")
         if args.score_mode == "separable" and args.coupled_kernel_size != 1:
             parser.error("--coupled_kernel_size only applies to coupled --score_mode values")
+        if args.score_mode == "separable" and args.coupled_pooling != "avg":
+            parser.error("--coupled_pooling only applies to coupled --score_mode values")
         press.fisher_window = args.fisher_window
         press.fisher_positions = args.fisher_positions
         press.fisher_labels = args.fisher_labels
+        press.fisher_position_aggregation = args.fisher_position_aggregation
         press.score_mode = args.score_mode
         press.coupled_kernel_size = args.coupled_kernel_size
+        press.coupled_pooling = args.coupled_pooling
+        press.first_stage_ratio = args.first_stage_ratio
         press.fisher_seed = args.fisher_seed
         press.attention_eps = args.attention_eps
 

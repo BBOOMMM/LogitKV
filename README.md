@@ -125,6 +125,9 @@ LogitKV uses a detached no-grad prefix and runs Fisher backward only on its trai
 `fisher_window`. `fisher_labels` independently samples that many labels at each
 position. LogitKV averages all position-label Fisher quadratic forms before the
 square root.
+`fisher_position_aggregation=max` keeps the label mean within each position but
+takes the maximum quadratic across positions, preserving KV tokens important to
+any trailing logit probe. The default `mean` retains the Monte Carlo average.
 `score_mode` selects one of three Stage-2 formulations:
 
 - `separable` (default) uses `(attention_score + attention_eps) * fisher_rms` and
@@ -140,6 +143,9 @@ values into FP32 ties. `coupled_kernel_size` optionally applies an odd-width
 `avg_pool1d` across neighboring KV positions before Top-K; its default `1`
 disables pooling, while `5` matches SnapKV's default neighborhood width. All
 modes retain the same attention-only Stage-1 safeguard.
+`coupled_pooling=max` optionally propagates local peaks without averaging them
+down; the default `avg` preserves the existing pooling behavior.
+`first_stage_ratio` controls the attention-only share of the retained budget.
 For direct model calls, use `press.prefill(model, input_ids, cache)` instead of the
 ordinary `with press(model)` API.
 

@@ -45,6 +45,7 @@ def string_match_all(preds, refs):
 
 def calculate_metrics(df: pd.DataFrame) -> dict:
     scores = {}
+    task_scores = []
     np_pattern = re.compile(r"[\x00-\x1f]")
     df = df.dropna()
     df["predicted_answer"] = df["predicted_answer"].apply(lambda x: np_pattern.sub("", x.strip()).strip())
@@ -57,7 +58,11 @@ def calculate_metrics(df: pd.DataFrame) -> dict:
         try:
             score = metric_fn(preds, refs)
             scores[task] = {"string_match": score}
+            task_scores.append(score)
         except Exception as e:
             print(f"Error in task {task}: {e}")
             scores[task] = None
+
+    macro_average = sum(task_scores) / len(task_scores) if task_scores else 0.0
+    scores["macro_average"] = {"string_match": round(macro_average, 2)}
     return scores

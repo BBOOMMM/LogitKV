@@ -25,6 +25,10 @@ logger = logging.getLogger(__name__)
 
 LogitKVScoreMode = Literal["separable", "coupled_diag", "coupled_full"]
 LOGITKV_SCORE_MODES = ("separable", "coupled_diag", "coupled_full")
+FisherPositionAggregation = Literal["mean", "max"]
+FISHER_POSITION_AGGREGATIONS = ("mean", "max")
+CoupledPooling = Literal["avg", "max"]
+COUPLED_POOLING_MODES = ("avg", "max")
 
 
 def _output_projection_by_head(module: nn.Module) -> torch.Tensor:
@@ -320,8 +324,10 @@ class LogitKVPress(BasePress):
     fisher_window: int = 32
     fisher_positions: int = 1
     fisher_labels: int = 1
+    fisher_position_aggregation: FisherPositionAggregation = "mean"
     score_mode: LogitKVScoreMode = "separable"
     coupled_kernel_size: int = 1
+    coupled_pooling: CoupledPooling = "avg"
     first_stage_ratio: float = 0.5
     attention_eps: float = 0.0
     fisher_eps: float = 1e-12
@@ -331,6 +337,7 @@ class LogitKVPress(BasePress):
 
     _states: dict[int, _LayerState] = field(default_factory=dict, init=False, repr=False)
     _quadratic_sums: dict[int, torch.Tensor] = field(default_factory=dict, init=False, repr=False)
+    _position_quadratic_sums: dict[int, torch.Tensor] = field(default_factory=dict, init=False, repr=False)
     _gradient_counts: dict[int, int] = field(default_factory=dict, init=False, repr=False)
     _scores: dict[int, torch.Tensor] = field(default_factory=dict, init=False, repr=False)
     _active: bool = field(default=False, init=False, repr=False)
@@ -367,6 +374,11 @@ class LogitKVPress(BasePress):
             raise ValueError("fisher_positions must not exceed fisher_window")
         if self.fisher_labels <= 0:
             raise ValueError("fisher_labels must be positive")
+        if self.fisher_position_aggregation not in FISHER_POSITION_AGGREGATIONS:
+            raise ValueError(
+                "fisher_position_aggregation must be one of "
+                f"{', '.join(FISHER_POSITION_AGGREGATIONS)}, got {self.fisher_position_aggregation!r}"
+            )
 
     def _validate_score_mode(self) -> None:
         if self.score_mode not in LOGITKV_SCORE_MODES:
@@ -375,8 +387,12 @@ class LogitKVPress(BasePress):
             raise ValueError("attention_eps must be 0 for coupled LogitKV score modes")
         if self.coupled_kernel_size <= 0 or self.coupled_kernel_size % 2 == 0:
             raise ValueError("coupled_kernel_size must be a positive odd integer")
+        if self.coupled_pooling not in COUPLED_POOLING_MODES:
+            raise ValueError(f"coupled_pooling must be one of {', '.join(COUPLED_POOLING_MODES)}")
         if self.score_mode == "separable" and self.coupled_kernel_size != 1:
             raise ValueError("coupled_kernel_size only applies to coupled LogitKV score modes")
+        if self.score_mode == "separable" and self.coupled_pooling != "avg":
+            raise ValueError("coupled_pooling only applies to coupled LogitKV score modes")
 
     @property
     def compression_ratio(self) -> float:
@@ -571,26 +587,48 @@ class LogitKVPress(BasePress):
                         mode=self.score_mode,
                         fisher_window=self.fisher_window,
                     )
-                if layer_idx not in self._quadratic_sums:
-                    self._quadratic_sums[layer_idx] = fisher_quadratic
-                    self._gradient_counts[layer_idx] = 1
+                gradient_count = self._gradient_counts.get(layer_idx, 0) + 1
+                self._gradient_counts[layer_idx] = gradient_count
+                if self.fisher_position_aggregation == "mean":
+                    # Preserve the original accumulation and division order so
+                    # default settings reproduce existing Top-K selections.
+                    if layer_idx not in self._quadratic_sums:
+                        self._quadratic_sums[layer_idx] = fisher_quadratic
+                    else:
+                        self._quadratic_sums[layer_idx].add_(fisher_quadratic)
                 else:
-                    self._quadratic_sums[layer_idx].add_(fisher_quadratic)
-                    self._gradient_counts[layer_idx] += 1
+                    if layer_idx not in self._position_quadratic_sums:
+                        self._position_quadratic_sums[layer_idx] = fisher_quadratic
+                    else:
+                        self._position_quadratic_sums[layer_idx].add_(fisher_quadratic)
 
-                gradient_count = self._gradient_counts[layer_idx]
                 if gradient_count > self._fisher_probe_count:
                     raise RuntimeError(
                         f"Layer {layer_idx} received {gradient_count} Fisher gradients; "
                         f"expected {self._fisher_probe_count}"
                     )
 
-                # Fisher matrices (and therefore their quadratic forms) are
-                # averaged before applying the score-mode-specific transform.
+                # Labels at the same logit position always estimate one Fisher
+                # expectation and are averaged first. Position estimates can
+                # then be averaged (standard Monte Carlo) or max-aggregated to
+                # preserve tokens important to any trailing prediction point.
+                if self.fisher_position_aggregation == "max" and gradient_count % self.fisher_labels == 0:
+                    position_quadratic = self._position_quadratic_sums.pop(layer_idx) / self.fisher_labels
+                    if layer_idx not in self._quadratic_sums:
+                        self._quadratic_sums[layer_idx] = position_quadratic
+                    else:
+                        torch.maximum(
+                            self._quadratic_sums[layer_idx],
+                            position_quadratic,
+                            out=self._quadratic_sums[layer_idx],
+                        )
+
                 if gradient_count == self._fisher_probe_count:
-                    fisher_quadratic_mean = self._quadratic_sums[layer_idx] / self._fisher_probe_count
+                    fisher_quadratic_aggregate = self._quadratic_sums[layer_idx]
+                    if self.fisher_position_aggregation == "mean":
+                        fisher_quadratic_aggregate = fisher_quadratic_aggregate / self._fisher_probe_count
                     if self.score_mode == "separable":
-                        fisher_rms = torch.sqrt(fisher_quadratic_mean.clamp_min(0.0) + self.fisher_eps)
+                        fisher_rms = torch.sqrt(fisher_quadratic_aggregate.clamp_min(0.0) + self.fisher_eps)
                         ranking_base = state.base_scores + self.attention_eps
                         scores = ranking_base * fisher_rms
                     else:
@@ -598,9 +636,10 @@ class LogitKVPress(BasePress):
                         # Rank directly by Q: sqrt and a fixed epsilon are
                         # mathematically unnecessary here and collapse tiny
                         # coupled values into large FP32 tie groups.
-                        scores = fisher_quadratic_mean.clamp_min(0.0)
+                        scores = fisher_quadratic_aggregate.clamp_min(0.0)
                         if self.coupled_kernel_size > 1:
-                            scores = F.avg_pool1d(
+                            pooling = F.avg_pool1d if self.coupled_pooling == "avg" else F.max_pool1d
+                            scores = pooling(
                                 scores,
                                 kernel_size=self.coupled_kernel_size,
                                 stride=1,
@@ -613,7 +652,7 @@ class LogitKVPress(BasePress):
                     if self.sanity_check and self.score_mode == "separable":
                         layer_ranking_check_passed = assert_root_squared_ranking(
                             ranking_base,
-                            fisher_quadratic_mean,
+                            fisher_quadratic_aggregate,
                             n_kept,
                             self.fisher_eps,
                             score_root=scores,
@@ -724,6 +763,7 @@ class LogitKVPress(BasePress):
         device = input_ids.device
         self._states.clear()
         self._quadratic_sums.clear()
+        self._position_quadratic_sums.clear()
         self._gradient_counts.clear()
         self._scores.clear()
         self._gradient_handles.clear()
@@ -818,9 +858,12 @@ class LogitKVPress(BasePress):
                 **self._profile_values,
                 "fisher_positions": self.fisher_positions,
                 "fisher_labels": self.fisher_labels,
+                "fisher_position_aggregation": self.fisher_position_aggregation,
                 "fisher_probe_count": self._fisher_probe_count,
                 "score_mode": self.score_mode,
                 "coupled_kernel_size": self.coupled_kernel_size,
+                "coupled_pooling": self.coupled_pooling,
+                "first_stage_ratio": self.first_stage_ratio,
                 "total_seconds": time.perf_counter() - total_started_at,
             }
             if self.profile and device.type == "cuda":
@@ -835,6 +878,7 @@ class LogitKVPress(BasePress):
                 parameter.requires_grad_(requires_grad)
             self._states.clear()
             self._quadratic_sums.clear()
+            self._position_quadratic_sums.clear()
             self._gradient_counts.clear()
             self._scores.clear()
             self._gradient_handles.clear()

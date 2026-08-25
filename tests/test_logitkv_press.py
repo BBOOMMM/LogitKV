@@ -141,6 +141,42 @@ def test_multiple_fisher_labels_average_quadratics_before_root():
     assert press._gradient_counts[0] == press._fisher_probe_count
 
 
+def test_fisher_position_max_averages_labels_then_preserves_each_positions_peak():
+    press = LogitKVPress(
+        SnapKVPress(compression_ratio=0.5),
+        fisher_window=4,
+        fisher_positions=2,
+        fisher_labels=2,
+        fisher_position_aggregation="max",
+        sanity_check=False,
+    )
+    press._states[0] = SimpleNamespace(
+        values=torch.empty(1, 1, 2, 1),
+        module=SimpleNamespace(layer_idx=0),
+        base_scores=torch.ones(1, 1, 2),
+    )
+    press._total_length = 2
+    press._profile_values = {"score_seconds": 0.0}
+    quadratics = [
+        torch.tensor([[[1.0, 9.0]]]),
+        torch.tensor([[[3.0, 5.0]]]),
+        torch.tensor([[[10.0, 1.0]]]),
+        torch.tensor([[[6.0, 3.0]]]),
+    ]
+
+    with patch(
+        "kvpress.presses.logitkv_press.fisher_quadratic_sensitivity",
+        side_effect=quadratics,
+    ):
+        hook = press._make_gradient_hook(0)
+        for _ in quadratics:
+            hook(torch.zeros(1, press.fisher_window, 1))
+
+    # Position means are [2, 7] and [8, 2], hence position-max is [8, 7].
+    expected_scores = torch.sqrt(torch.tensor([[[8.0, 7.0]]]) + press.fisher_eps)
+    torch.testing.assert_close(press._scores[0], expected_scores)
+
+
 def test_coupled_modes_rank_by_average_quadratic_without_attention_or_root():
     base_scores = torch.tensor([[[100.0, 0.01]]])
     first_quadratic = torch.tensor([[[1.0, 9.0]]])
@@ -216,7 +252,52 @@ def test_coupled_kernel_pooling_spreads_quadratic_scores_to_neighbors():
     torch.testing.assert_close(press._scores[0], expected, rtol=0, atol=0)
 
 
+def test_coupled_max_pooling_propagates_peak_without_averaging_it_down():
+    press = LogitKVPress(
+        SnapKVPress(compression_ratio=0.4),
+        fisher_window=4,
+        score_mode="coupled_diag",
+        coupled_kernel_size=3,
+        coupled_pooling="max",
+        sanity_check=False,
+    )
+    press._states[0] = SimpleNamespace(
+        keys=torch.empty(1, 1, 5, 1),
+        values=torch.empty(1, 1, 5, 1),
+        hidden_states=torch.empty(1, press.fisher_window, 1),
+        position_embeddings=(torch.empty(1), torch.empty(1)),
+        module=SimpleNamespace(layer_idx=0),
+        base_scores=torch.zeros(1, 1, 5),
+    )
+    press._total_length = 5
+    press._profile_values = {"score_seconds": 0.0}
+    quadratic = torch.tensor([[[0.0, 0.0, 9.0, 0.0, 0.0]]])
+
+    with patch(
+        "kvpress.presses.logitkv_press.coupled_fisher_quadratic_sensitivity",
+        return_value=quadratic,
+    ):
+        press._make_gradient_hook(0)(torch.zeros(1, press.fisher_window, 1))
+
+    expected = torch.tensor([[[0.0, 9.0, 9.0, 9.0, 0.0]]])
+    torch.testing.assert_close(press._scores[0], expected, rtol=0, atol=0)
+
+
 def test_score_mode_validation_rejects_invalid_mode_and_coupled_attention_epsilon():
+    try:
+        LogitKVPress(SnapKVPress(), fisher_position_aggregation="median")
+    except ValueError as error:
+        assert "fisher_position_aggregation" in str(error)
+    else:
+        raise AssertionError("Invalid Fisher position aggregation was accepted")
+
+    try:
+        LogitKVPress(SnapKVPress(), score_mode="coupled_diag", coupled_pooling="median")
+    except ValueError as error:
+        assert "coupled_pooling" in str(error)
+    else:
+        raise AssertionError("Invalid coupled pooling mode was accepted")
+
     try:
         LogitKVPress(SnapKVPress(), score_mode="unknown")
     except ValueError as error:

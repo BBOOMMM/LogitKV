@@ -97,6 +97,18 @@ PRESS_DICT = {
 }
 
 
+def _configure_snapkv_kernel_size(press, kernel_size: int) -> bool:
+    """Set the pooling kernel on a SnapKV-based press, if it has one."""
+
+    current = press
+    while current is not None:
+        if isinstance(current, (SnapKVPress, EfficientAdaSnapKVPress)):
+            current.kernel_size = kernel_size
+            return True
+        current = getattr(current, "press", None)
+    return False
+
+
 
 def evaluate(
     dataset: str = "ruler",
@@ -106,14 +118,19 @@ def evaluate(
     device: Optional[str] = None,
     press_name: str = "efficient_ada_denfensive",
     compression_ratio: float = 0.75,
+    snapkv_kernel_size: int = 7,
     fisher_window: int = 32,
     fisher_positions: int = 1,
     fisher_labels: int = 1,
+    fisher_position_aggregation: str = "mean",
     score_mode: str = "separable",
     coupled_kernel_size: int = 1,
+    coupled_pooling: str = "avg",
+    first_stage_ratio: float = 0.5,
     fisher_seed: int = 42,
     attention_eps: float = 0.0,
     fraction: float = 0.2,
+    tasks: Optional[str] = None,
     max_new_tokens: Optional[int] = None,
     max_context_length: Optional[int] = None,
     compress_questions: bool = False,
@@ -135,16 +152,24 @@ def evaluate(
         Press to use (see PRESS_DICT), by default "expected_attention"
     compression_ratio : float, optional
         Compression ratio for the press, by default 0.1
+    snapkv_kernel_size : int, optional
+        Odd pooling kernel size used by SnapKV-based presses, by default 7
     fisher_window : int, optional
         Number of trailing differentiable tokens used by LogitKV, by default 32
     fisher_positions : int, optional
         Number of trailing logit positions used by LogitKV, by default 1
     fisher_labels : int, optional
         Number of independently sampled labels per LogitKV probe position, by default 1
+    fisher_position_aggregation : str, optional
+        Aggregation across Fisher probe positions: mean or max, by default mean
     score_mode : str, optional
         LogitKV Stage-2 score: separable, coupled_diag, or coupled_full, by default separable
     coupled_kernel_size : int, optional
         Odd neighborhood-average kernel for coupled Q scores; 1 disables pooling, by default 1
+    coupled_pooling : str, optional
+        Coupled-Q neighborhood pooling: avg or max, by default avg
+    first_stage_ratio : float, optional
+        Fraction of the retained budget protected by attention-only Stage 1, by default 0.5
     fisher_seed : int, optional
         Sampling seed for LogitKV's Fisher probes, by default 42
     attention_eps : float, optional
@@ -153,6 +178,8 @@ def evaluate(
         Maximum number of new tokens to generate, by default use the default for the task (recommended)
     fraction : float, optional
         Fraction of the dataset to evaluate, by default 1.0
+    tasks : str, optional
+        Comma-separated task names to evaluate; None keeps every task, by default None
     max_context_length : int, optional
         Maximum number of tokens to use in the context. By default will use the maximum length supported by the model.
     compress_questions : bool, optional
@@ -161,10 +188,18 @@ def evaluate(
     assert dataset in DATASET_DICT, f"No dataset found for {dataset}"
     assert dataset in SCORER_DICT, f"No scorer found for {dataset}"
     data_dir = str(data_dir) if data_dir else None
+    requested_tasks = None
+    if tasks:
+        task_values = tasks.split(",") if isinstance(tasks, str) else tasks
+        requested_tasks = [str(task).strip() for task in task_values if str(task).strip()]
     # Load press
     if press_name is not None:
         assert press_name in PRESS_DICT
         press = PRESS_DICT[press_name]
+        assert snapkv_kernel_size > 0 and snapkv_kernel_size % 2 == 1, (
+            "snapkv_kernel_size must be a positive odd integer"
+        )
+        snapkv_kernel_size_used = _configure_snapkv_kernel_size(press, snapkv_kernel_size)
         if isinstance(press, (DuoAttentionPress)):
             press.head_compression_ratio = compression_ratio
         else:
@@ -173,24 +208,34 @@ def evaluate(
             assert fisher_window > 0, "fisher_window must be positive"
             assert 0 < fisher_positions <= fisher_window, "fisher_positions must be in [1, fisher_window]"
             assert fisher_labels > 0, "fisher_labels must be positive"
+            assert fisher_position_aggregation in ("mean", "max"), "invalid Fisher position aggregation"
             assert score_mode in ("separable", "coupled_diag", "coupled_full"), "invalid LogitKV score_mode"
             assert coupled_kernel_size > 0 and coupled_kernel_size % 2 == 1, (
                 "coupled_kernel_size must be a positive odd integer"
             )
+            assert coupled_pooling in ("avg", "max"), "invalid coupled pooling mode"
+            assert 0 <= first_stage_ratio <= 1, "first_stage_ratio must be in [0, 1]"
             assert attention_eps >= 0, "attention_eps must be non-negative"
             assert score_mode == "separable" or attention_eps == 0, "coupled score modes require attention_eps=0"
             assert score_mode != "separable" or coupled_kernel_size == 1, (
                 "coupled_kernel_size only applies to coupled score modes"
             )
+            assert score_mode != "separable" or coupled_pooling == "avg", (
+                "coupled_pooling only applies to coupled score modes"
+            )
             press.fisher_window = fisher_window
             press.fisher_positions = fisher_positions
             press.fisher_labels = fisher_labels
+            press.fisher_position_aggregation = fisher_position_aggregation
             press.score_mode = score_mode
             press.coupled_kernel_size = coupled_kernel_size
+            press.coupled_pooling = coupled_pooling
+            press.first_stage_ratio = first_stage_ratio
             press.fisher_seed = fisher_seed
             press.attention_eps = attention_eps
     else:
         press = None
+        snapkv_kernel_size_used = False
 
     if device is None:
         device = "cuda:7" if torch.cuda.is_available() else "cpu"
@@ -203,6 +248,8 @@ def evaluate(
         press_name or "fullkv",
         f"cr{compression_ratio:g}",
     ]
+    if snapkv_kernel_size_used:
+        filename_parts.append(f"sk{snapkv_kernel_size}")
     if isinstance(press, LogitKVPress):
         filename_parts.extend(
             [
@@ -212,10 +259,18 @@ def evaluate(
                 f"mode{score_mode}",
             ]
         )
+        if fisher_position_aggregation != "mean":
+            filename_parts.append(f"pagg{fisher_position_aggregation}")
         if score_mode != "separable":
             filename_parts.append(f"ck{coupled_kernel_size}")
+            if coupled_pooling != "avg":
+                filename_parts.append(f"cp{coupled_pooling}")
+        if first_stage_ratio != 0.5:
+            filename_parts.append(f"sr{first_stage_ratio:g}")
         filename_parts.extend([f"fs{fisher_seed}", f"ae{attention_eps:g}"])
     filename_parts.append(f"frac{fraction:.2f}")
+    if requested_tasks:
+        filename_parts.append(f"tasks{'+'.join(requested_tasks)}")
     if max_context_length is not None:
         filename_parts.append(f"max_context{max_context_length}")
     if compress_questions:
@@ -242,6 +297,12 @@ def evaluate(
             sampled_task_df = task_df.sample(frac=fraction, random_state=42)
             sampled_dfs.append(sampled_task_df)
         df = pd.concat(sampled_dfs)
+
+    if requested_tasks:
+        available_tasks = set(df["task"].unique())
+        missing_tasks = sorted(set(requested_tasks) - available_tasks)
+        assert not missing_tasks, f"Requested tasks are unavailable: {missing_tasks}"
+        df = df[df["task"].isin(requested_tasks)].copy()
 
     if compress_questions:
         df["context"] = df["context"] + df["question"]
@@ -273,8 +334,7 @@ def evaluate(
     print("model dtype: ", pipe.model.dtype, flush=True)
     # Run pipeline on each context
     df["predicted_answer"] = None
-    df_context = df.groupby("context")
-    assert all(df_context["answer_prefix"].nunique() == 1)
+    assert all(df.groupby("context")["answer_prefix"].nunique() == 1)
 
     if dataset == "longbench": 
         # evalutated_tasks = ["qasper"]
@@ -285,57 +345,67 @@ def evaluate(
         evalutated_tasks = None # Test all
     else:
         evalutated_tasks = None
-            
-    for context, df_ in tqdm(df_context, total=df["context"].nunique()):
 
-        task_name = df_["task"].iloc[0]
-
-        # skip specific tasks, which are not in the task_names
-        if evalutated_tasks is not None:
-            if task_name not in evalutated_tasks:
+    scorer = SCORER_DICT[dataset]
+    task_groups = df.groupby("task", sort=False)
+    total_context_groups = df.groupby(["task", "context"], sort=False).ngroups
+    with tqdm(total=total_context_groups) as progress:
+        for task_name, task_df in task_groups:
+            # skip specific tasks, which are not in the task_names
+            if evalutated_tasks is not None and task_name not in evalutated_tasks:
+                progress.update(task_df["context"].nunique())
                 continue
 
-        chat_template_bak = pipe.tokenizer.chat_template
-        bos_bak = pipe.tokenizer.bos_token
-        gen_config_eos_id_bak = pipe.model.generation_config.eos_token_id
+            for context, df_ in task_df.groupby("context", sort=False):
+                chat_template_bak = pipe.tokenizer.chat_template
+                bos_bak = pipe.tokenizer.bos_token
+                gen_config_eos_id_bak = pipe.model.generation_config.eos_token_id
 
-        if task_name in ["trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"]:
-            pipe.tokenizer.chat_template = None
-            pipe.tokenizer.bos_token = ""
-            if task_name in ["samsum"]:
-                pipe.model.generation_config.eos_token_id = [
-                    pipe.tokenizer.eos_token_id,
-                    pipe.tokenizer.encode("\n", add_special_tokens=False)[-1],
-                ]
+                if task_name in ["trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"]:
+                    pipe.tokenizer.chat_template = None
+                    pipe.tokenizer.bos_token = ""
+                    if task_name in ["samsum"]:
+                        pipe.model.generation_config.eos_token_id = [
+                            pipe.tokenizer.eos_token_id,
+                            pipe.tokenizer.encode("\n", add_special_tokens=False)[-1],
+                        ]
 
-        questions = df_["question"].to_list()
-        max_new_tokens_ = max_new_tokens if max_new_tokens is not None else df_["max_new_tokens"].iloc[0]
-        answer_prefix = df_["answer_prefix"].iloc[0]
-        Failure_count = 0
-        try:
-            output = pipe(
-                context,
-                questions=questions,
-                answer_prefix=answer_prefix,
-                press=press,
-                max_new_tokens=max_new_tokens_,
-                max_context_length=max_context_length,
-            )
-        except Exception as e:
-            print("An error occurred:", e)
-            output = {"answers": "Failure:" + str(e)}
-            Failure_count += 1
+                questions = df_["question"].to_list()
+                max_new_tokens_ = max_new_tokens if max_new_tokens is not None else df_["max_new_tokens"].iloc[0]
+                answer_prefix = df_["answer_prefix"].iloc[0]
+                Failure_count = 0
+                try:
+                    output = pipe(
+                        context,
+                        questions=questions,
+                        answer_prefix=answer_prefix,
+                        press=press,
+                        max_new_tokens=max_new_tokens_,
+                        max_context_length=max_context_length,
+                    )
+                except Exception as e:
+                    print("An error occurred:", e)
+                    output = {"answers": "Failure:" + str(e)}
+                    Failure_count += 1
 
-        df.loc[df_.index, "predicted_answer"] = output["answers"]
-        if press:
-            df.loc[df_.index, "compression_ratio"] = press.compression_ratio  # type:ignore[attr-defined]
-        else:
-            df.loc[df_.index, "compression_ratio"] = 0  # type:ignore[attr-defined]
+                df.loc[df_.index, "predicted_answer"] = output["answers"]
+                if press:
+                    df.loc[df_.index, "compression_ratio"] = press.compression_ratio  # type:ignore[attr-defined]
+                else:
+                    df.loc[df_.index, "compression_ratio"] = 0  # type:ignore[attr-defined]
 
-        # restore chat template
-        pipe.tokenizer.chat_template = chat_template_bak
-        pipe.tokenizer.bos_token = bos_bak
-        pipe.model.generation_config.eos_token_id = gen_config_eos_id_bak
+                # restore chat template
+                pipe.tokenizer.chat_template = chat_template_bak
+                pipe.tokenizer.bos_token = bos_bak
+                pipe.model.generation_config.eos_token_id = gen_config_eos_id_bak
+                progress.update(1)
+
+            completed_task_df = df.loc[task_df.index].copy()
+            try:
+                task_metrics = scorer(completed_task_df)
+                print(f"\nTask '{task_name}' metrics: {task_metrics}", flush=True)
+            except Exception as e:
+                print(f"\nFailed to calculate metrics for task '{task_name}': {e}", flush=True)
 
     # Save answers
     df[["predicted_answer", "compression_ratio"]].to_csv(str(save_filename), index=False)
@@ -344,10 +414,10 @@ def evaluate(
 
     df.to_csv(str(save_filename).replace(".csv", "_df.csv"), index=False)
     # Calculate metrics
-    scorer = SCORER_DICT[dataset]
     metrics = scorer(df)
-    with open(str(save_filename).replace(".csv", ".json"), "w") as f:
-        json.dump(metrics, f)
+    with open(str(save_filename).replace(".csv", ".json"), "w", encoding="utf-8") as f:
+        json.dump(metrics, f, ensure_ascii=False, indent=2)
+        f.write("\n")
     print(f"Average compression ratio: {df['compression_ratio'].mean():.2f}")
     print(f"Failure count: {Failure_count}")
     print(metrics)

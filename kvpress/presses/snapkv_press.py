@@ -27,7 +27,7 @@ class SnapKVPress(ScorerPress):
 
     compression_ratio: float = 0.0
     window_size: int = 32
-    kernel_size: int = 5
+    kernel_size: int = 7
 
     @staticmethod
     def compute_window_attention(module, hidden_states, keys, window_size, position_embeddings):
