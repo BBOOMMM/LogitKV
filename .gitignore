@@ -3,6 +3,7 @@ evaluation/results/*.xlsx
 evaluation/results/*.csv
 evaluation/results/*.json
 evaluation/logs/*
+evaluation/results/*
 
 # Python
 __pycache__/

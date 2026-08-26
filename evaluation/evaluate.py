@@ -4,6 +4,7 @@
 import json
 import logging
 from pathlib import Path
+import re
 import time
 from typing import Optional
 
@@ -52,6 +53,7 @@ from kvpress import (
     CakeGlobalPress,
     # CakeScorerPress,
 )
+from kvpress.presses.logitkv_press import FISHER_LABEL_SAMPLE_MODES
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +78,8 @@ PRESS_DICT = {
     # names below use independent press instances and are the recommended
     # configurations for LogitKV-vs-CriticalKV comparisons.
     "logitkv": LogitKVPress(SnapKVPress(), fisher_seed=42),
+    "logit_snapkv": LogitKVPress(SnapKVPress(), fisher_seed=42),
+    # Backward-compatible alias for the historical typo.
     "logit_sanpkv": LogitKVPress(SnapKVPress(), fisher_seed=42),
     "logit_adasnapkv": LogitKVPress(
         SnapKVPress(), allocation_mode="adaptive", fisher_seed=42
@@ -116,6 +120,109 @@ def _configure_snapkv_kernel_size(press, kernel_size: int) -> bool:
     return False
 
 
+LONGBENCH_TASK_GROUPS = {
+    "single_doc_qa": ["narrativeqa", "qasper", "multifieldqa_en"],
+    "multidoc_qa": ["hotpotqa", "2wikimqa", "musique"],
+    "summarization": ["gov_report", "qmsum", "multi_news"],
+    "fewshot": ["trec", "triviaqa", "samsum"],
+    "synthetic": ["passage_count", "passage_retrieval_en"],
+    "code": ["lcc", "repobench-p"],
+}
+
+LONGBENCH_TASK_GROUP_LABELS = {
+    "single_doc_qa": "SingleDoc QA",
+    "multidoc_qa": "multidoc QA",
+    "summarization": "summarization",
+    "fewshot": "fewshot",
+    "synthetic": "synthetic",
+    "code": "code",
+}
+
+# Also accept the labels used in the LongBench task listing, e.g. "SingleDoc
+# QA" and "multidoc QA", after normalizing spaces and punctuation.
+LONGBENCH_TASK_GROUP_ALIASES = {
+    "single_doc_qa": "single_doc_qa",
+    "singledoc_qa": "single_doc_qa",
+    "single_doc": "single_doc_qa",
+    "singledoc": "single_doc_qa",
+    "multidoc_qa": "multidoc_qa",
+    "multi_doc_qa": "multidoc_qa",
+    "multidoc": "multidoc_qa",
+    "multi_doc": "multidoc_qa",
+    "summarization": "summarization",
+    "summary": "summarization",
+    "sum": "summarization",
+    "fewshot": "fewshot",
+    "few_shot": "fewshot",
+    "synthetic": "synthetic",
+    "code": "code",
+}
+
+
+def _normalize_task_selector(selector: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", selector.strip().lower()).strip("_")
+
+
+def _resolve_requested_tasks(dataset: str, tasks=None, task=None):
+    """Expand task-group selectors and preserve support for exact task names."""
+    selectors = []
+    for value in (tasks, task):
+        if value:
+            if isinstance(value, str):
+                selectors.extend(value.split(","))
+            else:
+                selectors.extend(value)
+
+    if not selectors:
+        return None
+
+    requested_tasks = []
+    for raw_selector in selectors:
+        selector = str(raw_selector).strip()
+        if not selector:
+            continue
+
+        if dataset == "longbench":
+            group_name = LONGBENCH_TASK_GROUP_ALIASES.get(
+                _normalize_task_selector(selector)
+            )
+            if group_name is not None:
+                requested_tasks.extend(LONGBENCH_TASK_GROUPS[group_name])
+                continue
+
+        # An exact task name is still accepted for LongBench and other
+        # datasets, preserving the previous --tasks behavior.
+        requested_tasks.append(selector)
+
+    # Deduplicate while preserving category/task ordering for stable filenames.
+    return list(dict.fromkeys(requested_tasks)) or None
+
+
+def _longbench_category_for_task(task_name: str):
+    for category, category_tasks in LONGBENCH_TASK_GROUPS.items():
+        if task_name in category_tasks:
+            return category
+    return None
+
+
+def _print_longbench_category_summary(category: str, task_scores: dict):
+    """Print task scores and the macro-average for one LongBench category."""
+    category_label = LONGBENCH_TASK_GROUP_LABELS.get(category, category)
+    print(f"\nLongBench category '{category_label}':", flush=True)
+    for task_name, score in task_scores.items():
+        if score is None:
+            print(f"  {task_name}: N/A", flush=True)
+        else:
+            print(f"  {task_name}: {score:.2f}", flush=True)
+
+    valid_scores = [score for score in task_scores.values() if score is not None]
+    if valid_scores:
+        category_average = sum(valid_scores) / len(valid_scores)
+        print(f"  Category average: {category_average:.2f}", flush=True)
+    else:
+        print("  Category average: N/A", flush=True)
+
+
 
 def evaluate(
     dataset: str = "ruler",
@@ -129,6 +236,7 @@ def evaluate(
     fisher_window: int = 32,
     fisher_positions: int = 1,
     fisher_labels: int = 1,
+    fisherlabel_samplemode: str = "multinomial",
     fisher_position_aggregation: str = "mean",
     score_mode: str = "separable",
     coupled_kernel_size: int = 1,
@@ -138,6 +246,7 @@ def evaluate(
     attention_eps: float = 0.0,
     fraction: float = 0.2,
     tasks: Optional[str] = None,
+    task: Optional[str] = None,
     max_new_tokens: Optional[int] = None,
     max_context_length: Optional[int] = None,
     compress_questions: bool = False,
@@ -167,6 +276,8 @@ def evaluate(
         Number of trailing logit positions used by LogitKV, by default 1
     fisher_labels : int, optional
         Number of independently sampled labels per LogitKV probe position, by default 1
+    fisherlabel_samplemode : str, optional
+        Fisher label selection mode: multinomial or top_fisherposition, by default multinomial
     fisher_position_aggregation : str, optional
         Aggregation across Fisher probe positions: mean or max, by default mean
     score_mode : str, optional
@@ -186,7 +297,13 @@ def evaluate(
     fraction : float, optional
         Fraction of the dataset to evaluate, by default 1.0
     tasks : str, optional
-        Comma-separated task names to evaluate; None keeps every task, by default None
+        Comma-separated exact task names or LongBench task groups to evaluate;
+        None keeps every task, by default None. The supported LongBench groups
+        are single_doc_qa, multidoc_qa, summarization, fewshot, synthetic, and
+        code.
+    task : str, optional
+        Alias for tasks. It can be used to select one or more comma-separated
+        LongBench groups, for example ``--task single_doc_qa,multidoc_qa``.
     max_context_length : int, optional
         Maximum number of tokens to use in the context. By default will use the maximum length supported by the model.
     compress_questions : bool, optional
@@ -195,10 +312,7 @@ def evaluate(
     assert dataset in DATASET_DICT, f"No dataset found for {dataset}"
     assert dataset in SCORER_DICT, f"No scorer found for {dataset}"
     data_dir = str(data_dir) if data_dir else None
-    requested_tasks = None
-    if tasks:
-        task_values = tasks.split(",") if isinstance(tasks, str) else tasks
-        requested_tasks = [str(task).strip() for task in task_values if str(task).strip()]
+    requested_tasks = _resolve_requested_tasks(dataset, tasks=tasks, task=task)
     # Load press
     if press_name is not None:
         assert press_name in PRESS_DICT
@@ -215,6 +329,9 @@ def evaluate(
             assert fisher_window > 0, "fisher_window must be positive"
             assert 0 < fisher_positions <= fisher_window, "fisher_positions must be in [1, fisher_window]"
             assert fisher_labels > 0, "fisher_labels must be positive"
+            assert fisherlabel_samplemode in FISHER_LABEL_SAMPLE_MODES, (
+                "fisherlabel_samplemode must be one of " + ", ".join(FISHER_LABEL_SAMPLE_MODES)
+            )
             assert fisher_position_aggregation in ("mean", "max"), "invalid Fisher position aggregation"
             assert score_mode in ("separable", "coupled_diag", "coupled_full"), "invalid LogitKV score_mode"
             assert coupled_kernel_size > 0 and coupled_kernel_size % 2 == 1, (
@@ -233,6 +350,7 @@ def evaluate(
             press.fisher_window = fisher_window
             press.fisher_positions = fisher_positions
             press.fisher_labels = fisher_labels
+            press.fisherlabel_samplemode = fisherlabel_samplemode
             press.fisher_position_aggregation = fisher_position_aggregation
             press.score_mode = score_mode
             press.coupled_kernel_size = coupled_kernel_size
@@ -247,8 +365,10 @@ def evaluate(
     if device is None:
         device = "cuda:7" if torch.cuda.is_available() else "cpu"
 
-    save_dir = Path(__file__).parent / "results"
-    save_dir.mkdir(exist_ok=True)
+    # Keep result files separated by benchmark so LongBench and RULER runs do
+    # not share one directory.
+    save_dir = Path(__file__).parent / "results" / dataset
+    save_dir.mkdir(parents=True, exist_ok=True)
     filename_parts = [
         dataset.replace("/", "--").split("--")[-1],
         model.replace("/", "--").split("--")[-1],
@@ -274,6 +394,11 @@ def evaluate(
                 filename_parts.append(f"cp{coupled_pooling}")
         filename_parts.append(f"sr{first_stage_ratio:g}")
         filename_parts.extend([f"fs{fisher_seed}", f"ae{attention_eps:g}"])
+        fisherlabel_sample_tag = {
+            "multinomial": "flsmmulti",
+            "top_fisherposition": "flsmtop",
+        }[fisherlabel_samplemode]
+        filename_parts.append(fisherlabel_sample_tag)
     filename_parts.append(f"frac{fraction:.2f}")
     if requested_tasks:
         filename_parts.append(f"tasks{'+'.join(requested_tasks)}")
@@ -354,7 +479,18 @@ def evaluate(
 
     scorer = SCORER_DICT[dataset]
     task_groups = df.groupby("task", sort=False)
+    category_task_order = {}
+    category_task_scores = {}
+    printed_categories = set()
+    if dataset == "longbench":
+        for task_name in task_groups.groups:
+            category = _longbench_category_for_task(task_name)
+            if category is not None:
+                category_task_order.setdefault(category, []).append(task_name)
     total_context_groups = df.groupby(["task", "context"], sort=False).ngroups
+    # Count failed context groups across the entire evaluation run. This must
+    # not be reset inside the per-context loop.
+    Failure_count = 0
     with tqdm(total=total_context_groups) as progress:
         for task_name, task_df in task_groups:
             # skip specific tasks, which are not in the task_names
@@ -379,7 +515,6 @@ def evaluate(
                 questions = df_["question"].to_list()
                 max_new_tokens_ = max_new_tokens if max_new_tokens is not None else df_["max_new_tokens"].iloc[0]
                 answer_prefix = df_["answer_prefix"].iloc[0]
-                Failure_count = 0
                 try:
                     output = pipe(
                         context,
@@ -406,12 +541,30 @@ def evaluate(
                 pipe.model.generation_config.eos_token_id = gen_config_eos_id_bak
                 progress.update(1)
 
+            # Score the complete task after all of its contexts have finished.
             completed_task_df = df.loc[task_df.index].copy()
+            task_score = None
             try:
                 task_metrics = scorer(completed_task_df)
                 print(f"\nTask '{task_name}' metrics: {task_metrics}", flush=True)
+                if isinstance(task_metrics, dict):
+                    task_score = task_metrics.get(task_name)
             except Exception as e:
                 print(f"\nFailed to calculate metrics for task '{task_name}': {e}", flush=True)
+
+            if dataset == "longbench":
+                category = _longbench_category_for_task(task_name)
+                if category is not None and category not in printed_categories:
+                    category_task_scores.setdefault(category, {})[task_name] = task_score
+                    selected_category_tasks = category_task_order[category]
+                    if all(
+                        selected_task in category_task_scores[category]
+                        for selected_task in selected_category_tasks
+                    ):
+                        _print_longbench_category_summary(
+                            category, category_task_scores[category]
+                        )
+                        printed_categories.add(category)
 
     # Save answers
     df[["predicted_answer", "compression_ratio"]].to_csv(str(save_filename), index=False)

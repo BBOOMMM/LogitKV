@@ -49,6 +49,7 @@ from kvpress import (
     CakeGlobalPress,
     # CakeScorerPress,
 )
+from kvpress.presses.logitkv_press import FISHER_LABEL_SAMPLE_MODES
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,8 @@ PRESS_DICT = {
     # names below use independent press instances and are the recommended
     # configurations for LogitKV-vs-CriticalKV comparisons.
     "logitkv": LogitKVPress(SnapKVPress(), fisher_seed=42),
+    "logit_snapkv": LogitKVPress(SnapKVPress(), fisher_seed=42),
+    # Backward-compatible alias for the historical typo.
     "logit_sanpkv": LogitKVPress(SnapKVPress(), fisher_seed=42),
     "logit_adasnapkv": LogitKVPress(
         SnapKVPress(), allocation_mode="adaptive", fisher_seed=42
@@ -230,6 +233,12 @@ if __name__ == "__main__":
     parser.add_argument("--fisher_positions", type=int, default=1, help="LogitKV trailing Fisher probe positions.")
     parser.add_argument("--fisher_labels", type=int, default=1, help="Sampled labels per LogitKV probe position.")
     parser.add_argument(
+        "--fisherlabel_samplemode",
+        choices=FISHER_LABEL_SAMPLE_MODES,
+        default="multinomial",
+        help="LogitKV Fisher label selection mode.",
+    )
+    parser.add_argument(
         "--fisher_position_aggregation",
         choices=("mean", "max"),
         default="mean",
@@ -276,6 +285,8 @@ if __name__ == "__main__":
             parser.error("--fisher_positions must be in [1, --fisher_window]")
         if args.fisher_labels <= 0:
             parser.error("--fisher_labels must be positive")
+        if args.fisherlabel_samplemode not in FISHER_LABEL_SAMPLE_MODES:
+            parser.error(f"--fisherlabel_samplemode must be one of {FISHER_LABEL_SAMPLE_MODES}")
         if args.attention_eps < 0:
             parser.error("--attention_eps must be non-negative")
         if args.coupled_kernel_size <= 0 or args.coupled_kernel_size % 2 == 0:
@@ -291,6 +302,7 @@ if __name__ == "__main__":
         press.fisher_window = args.fisher_window
         press.fisher_positions = args.fisher_positions
         press.fisher_labels = args.fisher_labels
+        press.fisherlabel_samplemode = args.fisherlabel_samplemode
         press.fisher_position_aggregation = args.fisher_position_aggregation
         press.score_mode = args.score_mode
         press.coupled_kernel_size = args.coupled_kernel_size

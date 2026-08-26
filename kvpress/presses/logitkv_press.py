@@ -29,6 +29,8 @@ LogitKVAllocationMode = Literal["uniform", "adaptive"]
 LOGITKV_ALLOCATION_MODES = ("uniform", "adaptive")
 FisherPositionAggregation = Literal["mean", "max"]
 FISHER_POSITION_AGGREGATIONS = ("mean", "max")
+FisherLabelSampleMode = Literal["multinomial", "top_fisherposition"]
+FISHER_LABEL_SAMPLE_MODES = ("multinomial", "top_fisherposition")
 CoupledPooling = Literal["avg", "max"]
 COUPLED_POOLING_MODES = ("avg", "max")
 
@@ -327,8 +329,9 @@ class LogitKVPress(BasePress):
 
     The context is split into a detached no-grad prefix and a differentiable
     trailing Fisher window. ``fisher_positions`` trailing logit positions each
-    draw ``fisher_labels`` independent labels. Their per-layer Fisher quadratic
-    forms are averaged before the square root. ``score_mode`` selects the legacy
+    select ``fisher_labels`` labels according to ``fisherlabel_samplemode``.
+    Their per-layer Fisher quadratic forms are averaged before the square root.
+    ``score_mode`` selects the legacy
     separable attention-times-Fisher score or one of two position-wise coupled
     formulations. Coupled scores can optionally be smoothed across neighboring
     KV positions with ``coupled_kernel_size``. The full cache is then compressed
@@ -343,6 +346,7 @@ class LogitKVPress(BasePress):
     fisher_window: int = 32
     fisher_positions: int = 1
     fisher_labels: int = 1
+    fisherlabel_samplemode: FisherLabelSampleMode = "multinomial"
     fisher_position_aggregation: FisherPositionAggregation = "mean"
     score_mode: LogitKVScoreMode = "separable"
     coupled_kernel_size: int = 1
@@ -402,6 +406,11 @@ class LogitKVPress(BasePress):
             raise ValueError("fisher_positions must not exceed fisher_window")
         if self.fisher_labels <= 0:
             raise ValueError("fisher_labels must be positive")
+        if self.fisherlabel_samplemode not in FISHER_LABEL_SAMPLE_MODES:
+            raise ValueError(
+                "fisherlabel_samplemode must be one of "
+                f"{', '.join(FISHER_LABEL_SAMPLE_MODES)}, got {self.fisherlabel_samplemode!r}"
+            )
         if self.fisher_position_aggregation not in FISHER_POSITION_AGGREGATIONS:
             raise ValueError(
                 "fisher_position_aggregation must be one of "
@@ -535,7 +544,7 @@ class LogitKVPress(BasePress):
         raise RuntimeError("LogitKV could not find final logits in the model output")
 
     def _sample_log_probabilities(self, logits: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        """Sample Fisher labels independently at each trailing probe position."""
+        """Select Fisher labels independently at each trailing probe position."""
 
         if logits.shape[1] < self.fisher_positions:
             raise ValueError(f"Need {self.fisher_positions} trailing logits for Fisher probes, got {logits.shape[1]}")
@@ -545,21 +554,31 @@ class LogitKVPress(BasePress):
                 "Fisher probe logits do not require gradients. Run LogitKV inside its context manager "
                 "and do not wrap the model call in an un-overridable inference context."
             )
-        probabilities = torch.softmax(probe_logits.detach(), dim=-1)
-        if not torch.isfinite(probabilities).all():
-            raise FloatingPointError("Fisher probe probabilities contain non-finite values")
+        batch_size, num_positions, vocab_size = probe_logits.shape
+        if self.fisherlabel_samplemode == "multinomial":
+            probabilities = torch.softmax(probe_logits.detach(), dim=-1)
+            if not torch.isfinite(probabilities).all():
+                raise FloatingPointError("Fisher probe probabilities contain non-finite values")
 
-        generator = None
-        if self.fisher_seed is not None:
-            generator = torch.Generator(device=probabilities.device)
-            generator.manual_seed(self.fisher_seed)
-        batch_size, num_positions, vocab_size = probabilities.shape
-        sampled = torch.multinomial(
-            probabilities.reshape(batch_size * num_positions, vocab_size),
-            num_samples=self.fisher_labels,
-            replacement=True,
-            generator=generator,
-        ).reshape(batch_size, num_positions, self.fisher_labels)
+            generator = None
+            if self.fisher_seed is not None:
+                generator = torch.Generator(device=probabilities.device)
+                generator.manual_seed(self.fisher_seed)
+            sampled = torch.multinomial(
+                probabilities.reshape(batch_size * num_positions, vocab_size),
+                num_samples=self.fisher_labels,
+                replacement=True,
+                generator=generator,
+            ).reshape(batch_size, num_positions, self.fisher_labels)
+        else:
+            if self.fisher_labels > vocab_size:
+                raise ValueError(
+                    "fisher_labels cannot exceed the vocabulary size when "
+                    "fisherlabel_samplemode='top_fisherposition'"
+                )
+            sampled = torch.topk(
+                probe_logits.detach(), self.fisher_labels, dim=-1, largest=True, sorted=True
+            ).indices
         self.last_sampled_token_ids = sampled.detach().cpu()
         sampled_log_probabilities = torch.log_softmax(probe_logits, dim=-1).gather(-1, sampled)
         return tuple(
@@ -955,6 +974,7 @@ class LogitKVPress(BasePress):
                 **self._profile_values,
                 "fisher_positions": self.fisher_positions,
                 "fisher_labels": self.fisher_labels,
+                "fisherlabel_samplemode": self.fisherlabel_samplemode,
                 "fisher_position_aggregation": self.fisher_position_aggregation,
                 "fisher_probe_count": self._fisher_probe_count,
                 "score_mode": self.score_mode,

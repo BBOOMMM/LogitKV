@@ -591,6 +591,28 @@ def test_coupled_score_modes_complete_split_prefill_and_cache_compression_on_cpu
         assert press.last_ranking_check_passed is True
 
 
+def test_top_fisherposition_selects_highest_labels_per_position():
+    press = LogitKVPress(
+        SnapKVPress(),
+        fisher_window=2,
+        fisher_positions=2,
+        fisher_labels=2,
+        fisherlabel_samplemode="top_fisherposition",
+    )
+    logits = torch.tensor(
+        [[[1.0, 5.0, 2.0, 4.0], [8.0, 3.0, 7.0, 0.0]]],
+        requires_grad=True,
+    )
+
+    probes = press._sample_log_probabilities(logits)
+
+    torch.testing.assert_close(
+        press.last_sampled_token_ids,
+        torch.tensor([[[1, 3], [0, 2]]]),
+    )
+    assert len(probes) == 4
+
+
 def test_128_token_prefill_and_compressed_cache_decode_on_cpu():
     torch.manual_seed(4)
     config = LlamaConfig(

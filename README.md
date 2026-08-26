@@ -100,6 +100,22 @@ This script will:
 2. Run the same methods on RULER (4096 context length) with compression ratio 0.8 (20% Cache Size)
 3. Save logs to `evaluation/logs/` directory
 
+To evaluate selected LongBench task groups, pass one or more comma-separated
+group names through `--task`:
+
+```bash
+python evaluate.py \
+  --dataset longbench \
+  --data_dir "$KVPRESS_DATASETS/longbench" \
+  --model "$MODELS_DIR/Meta-Llama-3.1-8B-Instruct" \
+  --press_name logit_snapkv \
+  --task single_doc_qa,multidoc_qa
+```
+
+Supported groups are `single_doc_qa`, `multidoc_qa`, `summarization`,
+`fewshot`, `synthetic`, and `code`. Exact task names can also be passed, and
+the existing `--tasks` option remains supported.
+
 ## Efficiency Evaluation
 
 Run the following script to evaluate efficiency:
@@ -115,7 +131,7 @@ bash efficiency_evaluate.sh
 - `efficient_defensivekv` - DefensiveKV (per-head)
 - `efficient_layer_defensivekv` - GlobalDefensiveKV (global per-head)
 - `criti_adasnapkv` - CriticalKV built on  AdaKV
-- `logit_sanpkv` - LogitKV with SnapKV base scores and uniform per-head budgets
+- `logit_snapkv` - LogitKV with SnapKV base scores and uniform per-head budgets
 - `logit_adasnapkv` - LogitKV with SnapKV base scores and AdaKV-style adaptive head budgets
 - `adasnapkv` - AdaKV
 - `snapkv` - SnapKV
@@ -124,7 +140,10 @@ LogitKV uses a detached no-grad prefix and runs Fisher backward only on its trai
 `fisher_window`. The KVPress pipeline selects this split-prefill path automatically.
 `fisher_positions` selects trailing logit positions and must be between 1 and
 `fisher_window`. `fisher_labels` independently samples that many labels at each
-position. LogitKV averages all position-label Fisher quadratic forms before the
+position. `fisherlabel_samplemode=multinomial` preserves the default random
+label sampling; `fisherlabel_samplemode=top_fisherposition` directly selects
+the highest-logit `fisher_labels` tokens at each position. LogitKV averages all
+position-label Fisher quadratic forms before the
 square root, while ignoring causal positions whose output gradient is all zero
 so they do not dilute the average.
 `fisher_position_aggregation=max` keeps the label mean within each position but
@@ -162,6 +181,10 @@ cd evaluation/results
 python statistic.py
 
 ```
+
+Evaluation outputs are stored separately in `evaluation/results/longbench/`
+and `evaluation/results/ruler/`; the corresponding summary workbooks are
+written to those same directories.
 
 ## TODO
 

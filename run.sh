@@ -2,7 +2,7 @@ CUDA_VISIBLE_DEVICES=0 python evaluate.py \
   --dataset ruler \
   --data_dir "$KVPRESS_DATASETS/ruler/32768" \
   --model "$MODELS_DIR/Meta-Llama-3.1-8B-Instruct" \
-  --press_name logit_sanpkv \
+  --press_name logit_snapkv \
   --compression_ratio 0.6 \
   --fisher_window 32 \
   --fisher_positions 2 \

@@ -1,7 +1,30 @@
 import json
 from os import name
 import os.path
+from pathlib import Path
 import pandas as pd
+
+
+LONG_BENCH_CATEGORIES = {
+    "SingleDoc QA": ["narrativeqa", "qasper", "multifieldqa_en"],
+    "multidoc QA": ["hotpotqa", "2wikimqa", "musique"],
+    "summarization": ["gov_report", "qmsum", "multi_news"],
+    "fewshot": ["trec", "triviaqa", "samsum"],
+    "synthetic": ["passage_count", "passage_retrieval_en"],
+    "code": ["lcc", "repobench-p"],
+}
+
+AGGREGATE_KEYS = {"average_score", "macro_average"}
+
+
+def calculate_category_averages(score_dict, categories):
+    """Calculate one macro-average per category from task-level scores."""
+    category_scores = {}
+    for category, tasks in categories.items():
+        scores = [score_dict[task] for task in tasks if task in score_dict]
+        category_scores[category] = sum(scores) / len(scores) if scores else None
+    return category_scores
+
 
 # Function to calculate the average score from a JSON file
 def calculate_average_score(file_path):
@@ -16,6 +39,10 @@ def calculate_average_score(file_path):
         score_dict = {}
         # Iterate through the JSON data to sum scores
         for key, value in data.items():
+            # Ignore aggregate values that may have been added to a result JSON
+            # by evaluation/results/add_macro_average.py.
+            if key in AGGREGATE_KEYS:
+                continue
             # Handle both direct float values and dict with "string_match" key
             if isinstance(value, dict):
                 score = value.get("string_match", 0)
@@ -50,20 +77,30 @@ def process_dataset(json_files, dataset_name):
     all_keys = set()
     file_score_dicts = []
     
+    categories = LONG_BENCH_CATEGORIES if dataset_name.lower() == "longbench" else {}
+
     # First pass: collect all keys and scores
     for file in json_files:
         file_name, score_dict = calculate_average_score(file)
-        file_score_dicts.append((file_name, score_dict))
+        score_dict.update(calculate_category_averages(score_dict, categories))
+        file_score_dicts.append((Path(file).name, score_dict))
         all_keys.update(score_dict.keys())
     
     if not all_keys:
         print(f"No data found for {dataset_name}")
         return None
     
-    # Sort keys for consistent column ordering, with 'average_score' at the end
-    sorted_keys = sorted([k for k in all_keys if k != 'average_score'])
-    if 'average_score' in all_keys:
-        sorted_keys.append('average_score')
+    # Keep task columns first, category averages next, and the overall average
+    # as the final column.
+    category_keys = [category for category in categories if category in all_keys]
+    task_keys = sorted(
+        key
+        for key in all_keys
+        if key not in AGGREGATE_KEYS and key not in category_keys
+    )
+    sorted_keys = task_keys + category_keys
+    if "average_score" in all_keys:
+        sorted_keys.append("average_score")
     
     # Build data rows
     for file_name, score_dict in file_score_dicts:
@@ -77,43 +114,53 @@ def process_dataset(json_files, dataset_name):
 
 
 if __name__ == '__main__':
-    files = os.listdir('.')
-    print('Files in directory:')
-    print(files)
-    
-    # Filter and categorize JSON files
-    json_files = [file for file in files if file.endswith('.json')]
-    
-    longbench_files = [f for f in json_files if 'longbench' in f.lower()]
-    ruler_files = [f for f in json_files if 'ruler' in f.lower()]
-    other_files = [f for f in json_files if f not in longbench_files and f not in ruler_files]
-    
-    print(f"\nFound {len(longbench_files)} LongBench files, {len(ruler_files)} RULER files, {len(other_files)} other files")
-    
-    # Process LongBench results
-    if longbench_files:
-        df_longbench = process_dataset(longbench_files, 'longbench')
-        if df_longbench is not None:
-            output_file = 'longbench_scores.xlsx'
-            df_longbench.to_excel(output_file, index=False)
-            print(f"\nLongBench results saved to '{output_file}'")
-    else:
-        print("\nNo LongBench JSON files found")
-    
-    # Process RULER results
-    if ruler_files:
-        df_ruler = process_dataset(ruler_files, 'ruler')
-        if df_ruler is not None:
-            output_file = 'ruler_scores.xlsx'
-            df_ruler.to_excel(output_file, index=False)
-            print(f"\nRULER results saved to '{output_file}'")
-    else:
-        print("\nNo RULER JSON files found")
-    
-    # Process other results (if any)
+    results_root = Path(__file__).resolve().parent
+    root_json_files = sorted(results_root.glob('*.json'))
+
+    print('Result directories:')
+    print(f"  LongBench: {results_root / 'longbench'}")
+    print(f"  RULER: {results_root / 'ruler'}")
+
+    # Include legacy JSON files that were written directly to results/ so the
+    # statistics script remains useful after the result-directory migration.
+    dataset_files = {}
+    for dataset_name in ('longbench', 'ruler'):
+        nested_files = sorted((results_root / dataset_name).glob('*.json'))
+        legacy_files = [
+            path for path in root_json_files
+            if dataset_name in path.name.lower()
+        ]
+        dataset_files[dataset_name] = nested_files + legacy_files
+
+    other_files = [
+        path for path in root_json_files
+        if not any(dataset_name in path.name.lower() for dataset_name in ('longbench', 'ruler'))
+    ]
+
+    print(
+        f"\nFound {len(dataset_files['longbench'])} LongBench files, "
+        f"{len(dataset_files['ruler'])} RULER files, "
+        f"{len(other_files)} other files"
+    )
+
+    for dataset_name in ('longbench', 'ruler'):
+        json_files = dataset_files[dataset_name]
+        if not json_files:
+            print(f"\nNo {dataset_name.upper()} JSON files found")
+            continue
+
+        dataframe = process_dataset(json_files, dataset_name)
+        if dataframe is not None:
+            output_dir = results_root / dataset_name
+            output_dir.mkdir(parents=True, exist_ok=True)
+            output_file = output_dir / f'{dataset_name}_scores.xlsx'
+            dataframe.to_excel(output_file, index=False)
+            print(f"\n{dataset_name.upper()} results saved to '{output_file}'")
+
+    # Process legacy result files from other datasets, if any.
     if other_files:
         df_other = process_dataset(other_files, 'other')
         if df_other is not None:
-            output_file = 'other_scores.xlsx'
+            output_file = results_root / 'other_scores.xlsx'
             df_other.to_excel(output_file, index=False)
             print(f"\nOther results saved to '{output_file}'")
