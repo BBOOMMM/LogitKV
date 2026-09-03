@@ -53,7 +53,11 @@ from kvpress import (
     CakeGlobalPress,
     # CakeScorerPress,
 )
-from kvpress.presses.logitkv_press import FISHER_LABEL_SAMPLE_MODES
+from kvpress.presses.logitkv_press import (
+    COUPLED_EFFECT_MODES,
+    FISHER_BACKWARD_MODES,
+    FISHER_LABEL_SAMPLE_MODES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +119,18 @@ def _configure_snapkv_kernel_size(press, kernel_size: int) -> bool:
     while current is not None:
         if isinstance(current, (SnapKVPress, EfficientAdaSnapKVPress)):
             current.kernel_size = kernel_size
+            return True
+        current = getattr(current, "press", None)
+    return False
+
+
+def _configure_snapkv_window_size(press, window_size: int) -> bool:
+    """Set the observation window on a SnapKV-based press, if it has one."""
+
+    current = press
+    while current is not None:
+        if isinstance(current, (SnapKVPress, EfficientAdaSnapKVPress)):
+            current.window_size = window_size
             return True
         current = getattr(current, "press", None)
     return False
@@ -233,17 +249,28 @@ def evaluate(
     press_name: str = "efficient_ada_denfensive",
     compression_ratio: float = 0.75,
     snapkv_kernel_size: int = 7,
+    snapkv_window_size: int = 32,
     fisher_window: int = 32,
     fisher_positions: int = 1,
     fisher_labels: int = 1,
     fisherlabel_samplemode: str = "multinomial",
+    fisher_backward_mode: str = "serial",
+    fisher_sketches: int = 2,
     fisher_position_aggregation: str = "mean",
     score_mode: str = "separable",
     coupled_kernel_size: int = 1,
     coupled_pooling: str = "avg",
+    coupled_effect_mode: str = "value",
+    coupled_attention_power: float = 0.0,
+    coupled_key_weight: float = 0.0,
+    fisher_value_l2_weight: float = 0.0,
+    fisher_probe_normalization: str = "none",
     first_stage_ratio: float = 0.5,
+    allocation_mode: Optional[str] = None,
+    alpha_safeguard: Optional[float] = None,
     fisher_seed: int = 42,
     attention_eps: float = 0.0,
+    fisher_eps: float = 1e-12,
     fraction: float = 0.2,
     tasks: Optional[str] = None,
     task: Optional[str] = None,
@@ -270,14 +297,23 @@ def evaluate(
         Compression ratio for the press, by default 0.1
     snapkv_kernel_size : int, optional
         Odd pooling kernel size used by SnapKV-based presses, by default 7
+    snapkv_window_size : int, optional
+        Observation window used by SnapKV-based presses, independently of
+        LogitKV's fisher_window, by default 32
     fisher_window : int, optional
-        Number of trailing differentiable tokens used by LogitKV, by default 32
+        Number of trailing layer-output gradient positions used by LogitKV's
+        Fisher estimator, independently of snapkv_window_size, by default 32
     fisher_positions : int, optional
         Number of trailing logit positions used by LogitKV, by default 1
     fisher_labels : int, optional
-        Number of independently sampled labels per LogitKV probe position, by default 1
+        Number of sampled labels per position, or -1 for a probability-weighted
+        full-vocabulary sketch, by default 1
     fisherlabel_samplemode : str, optional
         Fisher label selection mode: multinomial or top_fisherposition, by default multinomial
+    fisher_backward_mode : str, optional
+        Fisher label backward mode: serial or label_sketch, by default serial
+    fisher_sketches : int, optional
+        Rademacher sketches per position in label_sketch mode, by default 2
     fisher_position_aggregation : str, optional
         Aggregation across Fisher probe positions: mean or max, by default mean
     score_mode : str, optional
@@ -286,12 +322,36 @@ def evaluate(
         Odd neighborhood-average kernel for coupled Q scores; 1 disables pooling, by default 1
     coupled_pooling : str, optional
         Coupled-Q neighborhood pooling: avg or max, by default avg
+    coupled_effect_mode : str, optional
+        Coupled-Q value effect: value or eviction. ``eviction`` models the
+        attention-output change from deleting a token and renormalizing the
+        remaining attention, by default value.
+    coupled_attention_power : float, optional
+        Non-negative power of a normalized SnapKV attention prior applied to
+        coupled scores, by default 0 (disabled).
+    coupled_key_weight : float, optional
+        Non-negative weight of an auxiliary key-path Fisher quadratic mixed
+        into coupled scores, by default 0 (disabled).
+    fisher_value_l2_weight : float, optional
+        Non-negative weight of a normalized isotropic value-projection L2 prior
+        mixed into separable Fisher Q, by default 0 (disabled).
+    fisher_probe_normalization : str, optional
+        Per-sketch head-mean normalization: none or head_mean, by default none.
     first_stage_ratio : float, optional
         Fraction of the retained budget protected by attention-only Stage 1, by default 0.5
+    allocation_mode : str, optional
+        Optional LogitKV allocation override: uniform or adaptive. By default,
+        preserve the mode selected by the press registry entry.
+    alpha_safeguard : float, optional
+        Optional adaptive LogitKV safeguard fraction, by default preserve the
+        press value.
     fisher_seed : int, optional
         Sampling seed for LogitKV's Fisher probes, by default 42
     attention_eps : float, optional
         Stabilizer added to LogitKV's base attention score, by default 0
+    fisher_eps : float, optional
+        Stabilizer added to the Fisher quadratic in squared separable mode, by
+        default 1e-12. Coupled modes do not use it.
     max_new_tokens : int, optional
         Maximum number of new tokens to generate, by default use the default for the task (recommended)
     fraction : float, optional
@@ -320,7 +380,9 @@ def evaluate(
         assert snapkv_kernel_size > 0 and snapkv_kernel_size % 2 == 1, (
             "snapkv_kernel_size must be a positive odd integer"
         )
+        assert snapkv_window_size > 0, "snapkv_window_size must be positive"
         snapkv_kernel_size_used = _configure_snapkv_kernel_size(press, snapkv_kernel_size)
+        snapkv_window_size_used = _configure_snapkv_window_size(press, snapkv_window_size)
         if isinstance(press, (DuoAttentionPress)):
             press.head_compression_ratio = compression_ratio
         else:
@@ -328,9 +390,18 @@ def evaluate(
         if isinstance(press, LogitKVPress):
             assert fisher_window > 0, "fisher_window must be positive"
             assert 0 < fisher_positions <= fisher_window, "fisher_positions must be in [1, fisher_window]"
-            assert fisher_labels > 0, "fisher_labels must be positive"
+            assert fisher_labels == -1 or fisher_labels > 0, (
+                "fisher_labels must be -1 (all-label sketch) or positive"
+            )
             assert fisherlabel_samplemode in FISHER_LABEL_SAMPLE_MODES, (
                 "fisherlabel_samplemode must be one of " + ", ".join(FISHER_LABEL_SAMPLE_MODES)
+            )
+            assert fisher_backward_mode in FISHER_BACKWARD_MODES, (
+                "fisher_backward_mode must be one of " + ", ".join(FISHER_BACKWARD_MODES)
+            )
+            assert fisher_sketches > 0, "fisher_sketches must be positive"
+            assert fisher_labels != -1 or fisher_backward_mode == "label_sketch", (
+                "fisher_labels=-1 requires fisher_backward_mode=label_sketch"
             )
             assert fisher_position_aggregation in ("mean", "max"), "invalid Fisher position aggregation"
             assert score_mode in ("separable", "coupled_diag", "coupled_full"), "invalid LogitKV score_mode"
@@ -338,8 +409,18 @@ def evaluate(
                 "coupled_kernel_size must be a positive odd integer"
             )
             assert coupled_pooling in ("avg", "max"), "invalid coupled pooling mode"
+            assert coupled_effect_mode in COUPLED_EFFECT_MODES, "invalid coupled effect mode"
+            assert coupled_attention_power >= 0, "coupled_attention_power must be non-negative"
+            assert coupled_key_weight >= 0, "coupled_key_weight must be non-negative"
+            assert fisher_value_l2_weight >= 0, "fisher_value_l2_weight must be non-negative"
+            assert fisher_probe_normalization in ("none", "head_mean"), "invalid Fisher probe normalization"
             assert 0 <= first_stage_ratio <= 1, "first_stage_ratio must be in [0, 1]"
+            if allocation_mode is not None:
+                assert allocation_mode in ("uniform", "adaptive"), "invalid LogitKV allocation mode"
+            if alpha_safeguard is not None:
+                assert 0 <= alpha_safeguard <= 1, "alpha_safeguard must be in [0, 1]"
             assert attention_eps >= 0, "attention_eps must be non-negative"
+            assert fisher_eps >= 0, "fisher_eps must be non-negative"
             assert score_mode == "separable" or attention_eps == 0, "coupled score modes require attention_eps=0"
             assert score_mode != "separable" or coupled_kernel_size == 1, (
                 "coupled_kernel_size only applies to coupled score modes"
@@ -351,16 +432,29 @@ def evaluate(
             press.fisher_positions = fisher_positions
             press.fisher_labels = fisher_labels
             press.fisherlabel_samplemode = fisherlabel_samplemode
+            press.fisher_backward_mode = fisher_backward_mode
+            press.fisher_sketches = fisher_sketches
             press.fisher_position_aggregation = fisher_position_aggregation
             press.score_mode = score_mode
             press.coupled_kernel_size = coupled_kernel_size
             press.coupled_pooling = coupled_pooling
+            press.coupled_effect_mode = coupled_effect_mode
+            press.coupled_attention_power = coupled_attention_power
+            press.coupled_key_weight = coupled_key_weight
+            press.fisher_value_l2_weight = fisher_value_l2_weight
+            press.fisher_probe_normalization = fisher_probe_normalization
             press.first_stage_ratio = first_stage_ratio
+            if allocation_mode is not None:
+                press.allocation_mode = allocation_mode
+            if alpha_safeguard is not None:
+                press.alpha_safeguard = alpha_safeguard
             press.fisher_seed = fisher_seed
             press.attention_eps = attention_eps
+            press.fisher_eps = fisher_eps
     else:
         press = None
         snapkv_kernel_size_used = False
+        snapkv_window_size_used = False
 
     if device is None:
         device = "cuda:7" if torch.cuda.is_available() else "cpu"
@@ -377,27 +471,53 @@ def evaluate(
     ]
     if snapkv_kernel_size_used:
         filename_parts.append(f"sk{snapkv_kernel_size}")
+    if snapkv_window_size_used:
+        filename_parts.append(f"sw{snapkv_window_size}")
     if isinstance(press, LogitKVPress):
+        fisher_labels_tag = "labelsall" if fisher_labels == -1 else f"labels{fisher_labels}"
         filename_parts.extend(
             [
                 f"fw{fisher_window}",
                 f"positions{fisher_positions}",
-                f"labels{fisher_labels}",
+                fisher_labels_tag,
                 f"mode{score_mode}",
+                f"fbm{fisher_backward_mode}",
             ]
         )
+        if fisher_backward_mode == "label_sketch":
+            filename_parts.append(f"fsk{fisher_sketches}")
         if fisher_position_aggregation != "mean":
             filename_parts.append(f"pagg{fisher_position_aggregation}")
         if score_mode != "separable":
             filename_parts.append(f"ck{coupled_kernel_size}")
             if coupled_pooling != "avg":
                 filename_parts.append(f"cp{coupled_pooling}")
+            if coupled_effect_mode != "value":
+                filename_parts.append(f"cem{coupled_effect_mode}")
+            if coupled_attention_power:
+                filename_parts.append(f"cap{coupled_attention_power:g}")
+            if coupled_key_weight:
+                filename_parts.append(f"ckw{coupled_key_weight:g}")
+        if score_mode == "separable" and fisher_value_l2_weight:
+            filename_parts.append(f"vl2{fisher_value_l2_weight:g}")
+        if fisher_probe_normalization != "none":
+            filename_parts.append(f"fpn{fisher_probe_normalization}")
+        if allocation_mode is not None:
+            filename_parts.append(f"alloc{allocation_mode}")
+        if alpha_safeguard is not None:
+            filename_parts.append(f"alpha{alpha_safeguard:g}")
         filename_parts.append(f"sr{first_stage_ratio:g}")
         filename_parts.extend([f"fs{fisher_seed}", f"ae{attention_eps:g}"])
-        fisherlabel_sample_tag = {
-            "multinomial": "flsmmulti",
-            "top_fisherposition": "flsmtop",
-        }[fisherlabel_samplemode]
+        if score_mode == "separable":
+            filename_parts.extend(["sformsq", f"fe{fisher_eps:g}"])
+        fisherlabel_sample_tag = (
+            "flsmall"
+            if fisher_labels == -1
+            else {
+                "multinomial": "flsmmulti",
+                "top_fisherposition": "flsmtop",
+            }[fisherlabel_samplemode]
+        )
         filename_parts.append(fisherlabel_sample_tag)
     filename_parts.append(f"frac{fraction:.2f}")
     if requested_tasks:
@@ -528,6 +648,13 @@ def evaluate(
                     print("An error occurred:", e)
                     output = {"answers": "Failure:" + str(e)}
                     Failure_count += 1
+                finally:
+                    # LogitKV creates a short-lived autograd graph for every
+                    # context.  Release cached blocks between contexts so a
+                    # single long example cannot strand fragmented VRAM for
+                    # the next example.
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
                 df.loc[df_.index, "predicted_answer"] = output["answers"]
                 if press:

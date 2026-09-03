@@ -49,7 +49,7 @@ from kvpress import (
     CakeGlobalPress,
     # CakeScorerPress,
 )
-from kvpress.presses.logitkv_press import FISHER_LABEL_SAMPLE_MODES
+from kvpress.presses.logitkv_press import FISHER_BACKWARD_MODES, FISHER_LABEL_SAMPLE_MODES
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +87,18 @@ PRESS_DICT = {
     "cake_global": CakeGlobalPress(),
     "fullkv": None,
 }
+
+
+def _configure_snapkv_window_size(press, window_size: int) -> bool:
+    """Set the observation window on a nested SnapKV-based press."""
+
+    current = press
+    while current is not None:
+        if isinstance(current, (SnapKVPress, EfficientAdaSnapKVPress)):
+            current.window_size = window_size
+            return True
+        current = getattr(current, "press", None)
+    return False
 
 
 def run_prefill(model, input_ids, cache, position_ids, press):
@@ -229,14 +241,42 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate model efficiency with different press methods.")
     parser.add_argument("--model_path", type=str, required=True, help="Path to the model.")
     parser.add_argument("--press_name", type=str, required=True, choices=PRESS_DICT.keys(), help="Name of the press method to use.")
-    parser.add_argument("--fisher_window", type=int, default=32, help="LogitKV differentiable trailing window.")
+    parser.add_argument(
+        "--snapkv_window_size",
+        type=int,
+        default=32,
+        help="SnapKV observation window, independent of LogitKV fisher_window.",
+    )
+    parser.add_argument(
+        "--fisher_window",
+        type=int,
+        default=32,
+        help="LogitKV Fisher-gradient window, independent of SnapKV's observation window.",
+    )
     parser.add_argument("--fisher_positions", type=int, default=1, help="LogitKV trailing Fisher probe positions.")
-    parser.add_argument("--fisher_labels", type=int, default=1, help="Sampled labels per LogitKV probe position.")
+    parser.add_argument(
+        "--fisher_labels",
+        type=int,
+        default=1,
+        help="Sampled labels per position, or -1 for a full-vocabulary probability-weighted sketch.",
+    )
     parser.add_argument(
         "--fisherlabel_samplemode",
         choices=FISHER_LABEL_SAMPLE_MODES,
         default="multinomial",
         help="LogitKV Fisher label selection mode.",
+    )
+    parser.add_argument(
+        "--fisher_backward_mode",
+        choices=FISHER_BACKWARD_MODES,
+        default="serial",
+        help="Serial label backward or per-position Rademacher label sketch.",
+    )
+    parser.add_argument(
+        "--fisher_sketches",
+        type=int,
+        default=2,
+        help="Rademacher sketches per position in label_sketch mode.",
     )
     parser.add_argument(
         "--fisher_position_aggregation",
@@ -270,6 +310,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--fisher_seed", type=int, default=42, help="LogitKV Fisher sampling seed.")
     parser.add_argument("--attention_eps", type=float, default=0.0, help="LogitKV base-attention stabilizer.")
+    parser.add_argument(
+        "--fisher_eps",
+        type=float,
+        default=1e-12,
+        help="LogitKV squared-separable Fisher-quadratic stabilizer.",
+    )
     args = parser.parse_args()
 
     model_path = args.model_path
@@ -280,15 +326,26 @@ if __name__ == "__main__":
 
 
     press = PRESS_DICT[press_name]
+    if args.snapkv_window_size <= 0:
+        parser.error("--snapkv_window_size must be positive")
+    _configure_snapkv_window_size(press, args.snapkv_window_size)
     if isinstance(press, LogitKVPress):
         if not 0 < args.fisher_positions <= args.fisher_window:
             parser.error("--fisher_positions must be in [1, --fisher_window]")
-        if args.fisher_labels <= 0:
-            parser.error("--fisher_labels must be positive")
+        if args.fisher_labels == 0 or args.fisher_labels < -1:
+            parser.error("--fisher_labels must be -1 (all-label sketch) or positive")
         if args.fisherlabel_samplemode not in FISHER_LABEL_SAMPLE_MODES:
             parser.error(f"--fisherlabel_samplemode must be one of {FISHER_LABEL_SAMPLE_MODES}")
+        if args.fisher_backward_mode not in FISHER_BACKWARD_MODES:
+            parser.error(f"--fisher_backward_mode must be one of {FISHER_BACKWARD_MODES}")
+        if args.fisher_sketches <= 0:
+            parser.error("--fisher_sketches must be positive")
+        if args.fisher_labels == -1 and args.fisher_backward_mode != "label_sketch":
+            parser.error("--fisher_labels -1 requires --fisher_backward_mode label_sketch")
         if args.attention_eps < 0:
             parser.error("--attention_eps must be non-negative")
+        if args.fisher_eps < 0:
+            parser.error("--fisher_eps must be non-negative")
         if args.coupled_kernel_size <= 0 or args.coupled_kernel_size % 2 == 0:
             parser.error("--coupled_kernel_size must be a positive odd integer")
         if not 0 <= args.first_stage_ratio <= 1:
@@ -303,6 +360,8 @@ if __name__ == "__main__":
         press.fisher_positions = args.fisher_positions
         press.fisher_labels = args.fisher_labels
         press.fisherlabel_samplemode = args.fisherlabel_samplemode
+        press.fisher_backward_mode = args.fisher_backward_mode
+        press.fisher_sketches = args.fisher_sketches
         press.fisher_position_aggregation = args.fisher_position_aggregation
         press.score_mode = args.score_mode
         press.coupled_kernel_size = args.coupled_kernel_size
@@ -310,6 +369,7 @@ if __name__ == "__main__":
         press.first_stage_ratio = args.first_stage_ratio
         press.fisher_seed = args.fisher_seed
         press.attention_eps = args.attention_eps
+        press.fisher_eps = args.fisher_eps
 
     model_kwargs = {"attn_implementation": "flash_attention_2"}
     if isinstance(press, ObservedAttentionPress):

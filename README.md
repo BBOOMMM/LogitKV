@@ -131,28 +131,48 @@ bash efficiency_evaluate.sh
 - `efficient_defensivekv` - DefensiveKV (per-head)
 - `efficient_layer_defensivekv` - GlobalDefensiveKV (global per-head)
 - `criti_adasnapkv` - CriticalKV built on  AdaKV
-- `logit_snapkv` - LogitKV with SnapKV base scores and uniform per-head budgets
+- `logit_snapkv` - LogitKV with SnapKV base scores; the evaluator can select
+  uniform or adaptive per-head budgets
 - `logit_adasnapkv` - LogitKV with SnapKV base scores and AdaKV-style adaptive head budgets
 - `adasnapkv` - AdaKV
 - `snapkv` - SnapKV
 
-LogitKV uses a detached no-grad prefix and runs Fisher backward only on its trailing
-`fisher_window`. The KVPress pipeline selects this split-prefill path automatically.
+LogitKV uses a detached no-grad prefix and computes Fisher sensitivity only from
+its trailing `fisher_window`. SnapKV's observation window is configured
+independently by `snapkv_window_size` (default `32`), so changing
+`fisher_window` does not change the SnapKV score. The split-prefill suffix uses
+the larger of the two windows so both scores can be computed correctly. The
+KVPress pipeline selects this split-prefill path automatically.
 `fisher_positions` selects trailing logit positions and must be between 1 and
 `fisher_window`. `fisher_labels` independently samples that many labels at each
 position. `fisherlabel_samplemode=multinomial` preserves the default random
 label sampling; `fisherlabel_samplemode=top_fisherposition` directly selects
 the highest-logit `fisher_labels` tokens at each position. LogitKV averages all
-position-label Fisher quadratic forms before the
-square root, while ignoring causal positions whose output gradient is all zero
+position-label Fisher quadratic forms before applying the squared separable
+score, while ignoring causal positions whose output gradient is all zero
 so they do not dilute the average.
+`fisher_backward_mode=serial` performs one backward per selected label.
+`fisher_backward_mode=label_sketch` instead forms `fisher_sketches` independent
+Rademacher combinations of the labels at each position, reducing the backward
+count from `fisher_positions * fisher_labels` to
+`fisher_positions * fisher_sketches`. The sketch signs use a deterministic
+stream derived from `fisher_seed`; there is no separate sketch seed.
+Setting `fisher_labels=-1` with `label_sketch` uses the complete vocabulary
+instead of sampled labels. Each Rademacher sign is weighted by the square root
+of the detached model probability, so the sketched gradient has the exact
+categorical Fisher covariance in expectation. The implementation performs a
+vectorized vocabulary reduction and still uses only
+`fisher_positions * fisher_sketches` backward passes.
 `fisher_position_aggregation=max` keeps the label mean within each position but
 takes the maximum quadratic across positions, preserving KV tokens important to
 any trailing logit probe. The default `mean` retains the Monte Carlo average.
+In `separable` mode, `fisher_eps` is added to the aggregated Fisher quadratic.
+It defaults to `1e-12` and can be set explicitly with
+`--fisher_eps`; coupled modes rank the quadratic directly and do not use it.
 `score_mode` selects one of three Stage-2 formulations:
 
-- `separable` (default) uses `(attention_score + attention_eps) * fisher_rms` and
-  reproduces the existing LogitKV v2 score.
+- `separable` (default) uses
+  `(attention_score + attention_eps)^2 * (fisher_quadratic + fisher_eps)`.
 - `coupled_diag` sums squared position-wise contributions
   `A[t,i] * (g[t]^T V[i] W_O)`.
 - `coupled_full` sums the position-wise contributions first and then squares.

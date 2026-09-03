@@ -10,6 +10,7 @@ from kvpress.presses.logitkv_press import (
     assert_root_squared_ranking,
     coupled_fisher_quadratic_sensitivity,
     fisher_rms_sensitivity,
+    value_projection_l2_quadratic,
 )
 from kvpress.presses.snapkv_press import SnapKVPress
 
@@ -62,6 +63,18 @@ def test_fisher_rms_ignores_zero_gradient_positions():
     expected = fisher_rms_sensitivity(values, output_grad[:, 1:2], module, fisher_window=4)
 
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+def test_value_projection_l2_quadratic_matches_explicit_reference_with_gqa():
+    torch.manual_seed(14)
+    module = DummyAttention(num_heads=4, num_kv_heads=2, head_dim=3)
+    values = torch.randn(2, 2, 5, 3)
+    projection = module.o_proj.weight.transpose(0, 1).reshape(4, 3, -1)
+    repeated_values = values.repeat_interleave(2, dim=1)
+    explicit = torch.einsum("bhkd,hdm->bhkm", repeated_values, projection).square().sum(dim=-1)
+    expected = explicit.reshape(2, 2, 2, 5).mean(dim=2)
+
+    torch.testing.assert_close(value_projection_l2_quadratic(values, module), expected, rtol=1e-5, atol=1e-6)
 
 
 def test_coupled_fisher_modes_match_explicit_attention_reference_with_gqa():
@@ -118,7 +131,7 @@ def test_coupled_fisher_modes_match_explicit_attention_reference_with_gqa():
         torch.testing.assert_close(actual, expected_quadratic, rtol=1e-5, atol=1e-6)
 
 
-def test_multiple_fisher_labels_average_quadratics_before_root():
+def test_multiple_fisher_labels_average_quadratics_before_squared_score():
     press = LogitKVPress(
         SnapKVPress(compression_ratio=0.5),
         fisher_window=4,
@@ -149,7 +162,7 @@ def test_multiple_fisher_labels_average_quadratics_before_root():
         assert 0 not in press._scores
         hook(torch.zeros(1, press.fisher_window, 1))
 
-    expected_scores = (base_scores + press.attention_eps) * torch.sqrt(expected_quadratic + press.fisher_eps)
+    expected_scores = (base_scores + press.attention_eps).square() * (expected_quadratic + press.fisher_eps)
     torch.testing.assert_close(press._scores[0], expected_scores)
     assert press._gradient_counts[0] == press._fisher_probe_count
 
@@ -186,7 +199,7 @@ def test_fisher_position_max_averages_labels_then_preserves_each_positions_peak(
             hook(torch.zeros(1, press.fisher_window, 1))
 
     # Position means are [2, 7] and [8, 2], hence position-max is [8, 7].
-    expected_scores = torch.sqrt(torch.tensor([[[8.0, 7.0]]]) + press.fisher_eps)
+    expected_scores = torch.tensor([[[8.0, 7.0]]]) + press.fisher_eps
     torch.testing.assert_close(press._scores[0], expected_scores)
 
 
@@ -320,6 +333,35 @@ def test_coupled_max_pooling_propagates_peak_without_averaging_it_down():
     torch.testing.assert_close(press._scores[0], expected, rtol=0, atol=0)
 
 
+def test_coupled_attention_prior_softly_reweights_downstream_scores():
+    press = LogitKVPress(
+        SnapKVPress(compression_ratio=0.4),
+        fisher_window=4,
+        score_mode="coupled_diag",
+        coupled_attention_power=1.0,
+        sanity_check=False,
+    )
+    press._states[0] = SimpleNamespace(
+        keys=torch.empty(1, 1, 3, 1),
+        values=torch.empty(1, 1, 3, 1),
+        hidden_states=torch.empty(1, press.fisher_window, 1),
+        position_embeddings=(torch.empty(1), torch.empty(1)),
+        module=SimpleNamespace(layer_idx=0),
+        base_scores=torch.tensor([[[1.0, 2.0, 3.0]]]),
+    )
+    press._total_length = 3
+    press._profile_values = {"score_seconds": 0.0}
+    quadratic = torch.tensor([[[1.0, 4.0, 1.0]]])
+
+    with patch(
+        "kvpress.presses.logitkv_press.coupled_fisher_quadratic_sensitivity",
+        return_value=quadratic,
+    ):
+        press._make_gradient_hook(0)(torch.zeros(1, press.fisher_window, 1))
+
+    torch.testing.assert_close(press._scores[0], torch.tensor([[[0.5, 4.0, 1.5]]]))
+
+
 def test_score_mode_validation_rejects_invalid_mode_and_coupled_attention_epsilon():
     try:
         LogitKVPress(SnapKVPress(), fisher_position_aggregation="median")
@@ -327,6 +369,35 @@ def test_score_mode_validation_rejects_invalid_mode_and_coupled_attention_epsilo
         assert "fisher_position_aggregation" in str(error)
     else:
         raise AssertionError("Invalid Fisher position aggregation was accepted")
+
+    try:
+        LogitKVPress(SnapKVPress(), fisher_backward_mode="batched")
+    except ValueError as error:
+        assert "fisher_backward_mode" in str(error)
+    else:
+        raise AssertionError("Invalid Fisher backward mode was accepted")
+
+    try:
+        LogitKVPress(SnapKVPress(), fisher_sketches=0)
+    except ValueError as error:
+        assert "fisher_sketches" in str(error)
+    else:
+        raise AssertionError("Non-positive Fisher sketch count was accepted")
+
+    for invalid_label_count in (0, -2):
+        try:
+            LogitKVPress(SnapKVPress(), fisher_labels=invalid_label_count)
+        except ValueError as error:
+            assert "fisher_labels" in str(error)
+        else:
+            raise AssertionError("Invalid Fisher label count was accepted")
+
+    try:
+        LogitKVPress(SnapKVPress(), fisher_labels=-1, fisher_backward_mode="serial")
+    except ValueError as error:
+        assert "label_sketch" in str(error)
+    else:
+        raise AssertionError("All-label Fisher mode accepted serial backward")
 
     try:
         LogitKVPress(SnapKVPress(), score_mode="coupled_diag", coupled_pooling="median")
@@ -341,6 +412,13 @@ def test_score_mode_validation_rejects_invalid_mode_and_coupled_attention_epsilo
         assert "score_mode" in str(error)
     else:
         raise AssertionError("Invalid score mode was accepted")
+
+    try:
+        LogitKVPress(SnapKVPress(), score_mode="coupled_diag", coupled_key_weight=-1)
+    except ValueError as error:
+        assert "coupled_key_weight" in str(error)
+    else:
+        raise AssertionError("Negative coupled key-path weight was accepted")
 
     try:
         LogitKVPress(SnapKVPress(), score_mode="coupled_diag", attention_eps=1e-4)
@@ -397,19 +475,19 @@ def test_root_and_squared_scores_have_identical_topk_ranking():
     assert_root_squared_ranking(long_attention_scores, long_fisher_q, long_k, fisher_eps)
 
     # A true selection mismatch is logged but must not abort compression; the
-    # production path continues with the root-form score.
+    # production path continues with the squared-form score.
     close_attention_scores = torch.ones(1, 1, 2)
     close_fisher_q = torch.tensor([[[1.0, 0.99999]]])
-    perturbed_root_scores = torch.sqrt(close_fisher_q + fisher_eps)
-    perturbed_root_scores[..., 0] -= 6e-6
-    perturbed_root_scores[..., 1] += 6e-6
+    perturbed_squared_scores = close_fisher_q + fisher_eps
+    perturbed_squared_scores[..., 0] -= 6e-6
+    perturbed_squared_scores[..., 1] += 6e-6
     with patch("kvpress.presses.logitkv_press.logger.warning") as ranking_warning:
         check_passed = assert_root_squared_ranking(
             close_attention_scores,
             close_fisher_q,
             1,
             fisher_eps,
-            score_root=perturbed_root_scores,
+            score_squared=perturbed_squared_scores,
             layer_idx=7,
         )
     assert check_passed is False
@@ -421,12 +499,12 @@ def test_root_and_squared_scores_have_identical_topk_ranking():
             fisher_q,
             k,
             fisher_eps,
-            score_root=attention_scores * fisher_q,
+            score_squared=attention_scores * fisher_q,
         )
     except RuntimeError as error:
-        assert "sqrt" in str(error)
+        assert "squared score" in str(error)
     else:
-        raise AssertionError("The sanity check did not detect a missing square root")
+        raise AssertionError("The sanity check did not detect an invalid squared score")
 
 
 def _capture_attention_outputs(model, cache, *, input_ids=None, inputs_embeds=None):
@@ -587,8 +665,49 @@ def test_coupled_score_modes_complete_split_prefill_and_cache_compression_on_cpu
         assert outputs.logits.shape == (1, 1, config.vocab_size)
         assert cache.get_seq_length() == 16
         assert press.last_profile["score_mode"] == mode
+        assert press.last_profile["separable_score_form"] == "squared"
+        assert press.last_profile["fisher_eps"] == press.fisher_eps
         assert press.last_profile["coupled_kernel_size"] == 1
         assert press.last_ranking_check_passed is True
+
+
+def test_fisher_and_snapkv_windows_are_independent():
+    torch.manual_seed(13)
+    config = LlamaConfig(
+        vocab_size=41,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=64,
+    )
+    model = LlamaForCausalLM(config).eval()
+    input_ids = torch.randint(0, config.vocab_size, (1, 32))
+
+    for fisher_window, snapkv_window, expected_prefill_window in ((4, 12, 12), (12, 4, 12)):
+        cache = DynamicCache()
+        press = LogitKVPress(
+            SnapKVPress(compression_ratio=0.5, window_size=snapkv_window, kernel_size=5),
+            fisher_window=fisher_window,
+            fisher_positions=1,
+            fisher_labels=1,
+            fisher_seed=0,
+        )
+
+        with patch.object(
+            press.press,
+            "score_from_window",
+            wraps=press.press.score_from_window,
+        ) as score_from_window:
+            with torch.inference_mode():
+                press.prefill(model, input_ids, cache)
+
+        assert cache.get_seq_length() == 16
+        assert score_from_window.call_args.kwargs["window_size"] == snapkv_window
+        assert press.last_profile["fisher_window"] == fisher_window
+        assert press.last_profile["base_score_window"] == snapkv_window
+        assert press.last_profile["prefill_window"] == expected_prefill_window
 
 
 def test_top_fisherposition_selects_highest_labels_per_position():
@@ -611,6 +730,150 @@ def test_top_fisherposition_selects_highest_labels_per_position():
         torch.tensor([[[1, 3], [0, 2]]]),
     )
     assert len(probes) == 4
+
+
+def test_label_sketch_reduces_backward_probes_and_reuses_fisher_seed():
+    logits = torch.empty(1, 2, 4)
+    label_objectives = torch.arange(6.0, requires_grad=True)
+
+    def make_probes():
+        press = LogitKVPress(
+            SnapKVPress(),
+            fisher_window=2,
+            fisher_positions=2,
+            fisher_labels=3,
+            fisherlabel_samplemode="top_fisherposition",
+            fisher_backward_mode="label_sketch",
+            fisher_sketches=2,
+            fisher_seed=17,
+        )
+        with patch.object(
+            press,
+            "_sample_log_probabilities",
+            return_value=tuple(label_objectives.unbind()),
+        ):
+            probes = press._make_fisher_probes(logits)
+        return press, probes
+
+    first_press, first_probes = make_probes()
+    second_press, second_probes = make_probes()
+
+    assert first_press._fisher_probe_count == 4
+    assert len(first_probes) == first_press.fisher_positions * first_press.fisher_sketches
+    assert len(first_probes) < first_press.fisher_positions * first_press.fisher_labels
+    torch.testing.assert_close(torch.stack(first_probes), torch.stack(second_probes))
+
+    for probe in first_probes:
+        gradient = torch.autograd.grad(probe, label_objectives, retain_graph=True)[0]
+        nonzero = gradient[gradient != 0]
+        assert nonzero.numel() > 0
+        expected_magnitude = torch.full_like(nonzero, 1 / first_press.fisher_labels**0.5)
+        torch.testing.assert_close(nonzero.abs(), expected_magnitude)
+
+
+def test_all_label_sketch_has_exact_categorical_fisher_covariance_in_expectation():
+    logits = torch.tensor([[[0.3, -0.2]]], requires_grad=True)
+    press = LogitKVPress(
+        SnapKVPress(),
+        fisher_window=1,
+        fisher_positions=1,
+        fisher_labels=-1,
+        fisher_backward_mode="label_sketch",
+        fisher_sketches=4,
+        fisher_seed=5,
+    )
+    sign_bits = [
+        torch.tensor([[0, 0]], dtype=torch.int8),
+        torch.tensor([[0, 1]], dtype=torch.int8),
+        torch.tensor([[1, 0]], dtype=torch.int8),
+        torch.tensor([[1, 1]], dtype=torch.int8),
+    ]
+
+    with patch("torch.randint", side_effect=sign_bits):
+        probes = press._make_fisher_probes(logits)
+
+    gradients = []
+    for probe in probes:
+        gradients.append(torch.autograd.grad(probe, logits, retain_graph=True)[0].flatten())
+    estimated_fisher = torch.stack([gradient.outer(gradient) for gradient in gradients]).mean(dim=0)
+
+    probabilities = torch.softmax(logits.detach().flatten(), dim=0)
+    expected_fisher = torch.diag(probabilities) - probabilities.outer(probabilities)
+    torch.testing.assert_close(estimated_fisher, expected_fisher, rtol=1e-5, atol=1e-6)
+    assert press.last_sampled_token_ids is None
+
+
+def test_label_sketch_prefill_uses_positions_times_sketches_backwards():
+    torch.manual_seed(14)
+    config = LlamaConfig(
+        vocab_size=41,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=64,
+    )
+    model = LlamaForCausalLM(config).eval()
+    input_ids = torch.randint(0, config.vocab_size, (1, 32))
+    press = LogitKVPress(
+        SnapKVPress(compression_ratio=0.5, window_size=8, kernel_size=5),
+        fisher_window=8,
+        fisher_positions=2,
+        fisher_labels=3,
+        fisher_backward_mode="label_sketch",
+        fisher_sketches=2,
+        fisher_seed=17,
+    )
+
+    with patch("torch.autograd.backward", wraps=torch.autograd.backward) as backward:
+        with torch.inference_mode():
+            press.prefill(model, input_ids, DynamicCache())
+
+    assert backward.call_count == 4
+    assert backward.call_count == press.fisher_positions * press.fisher_sketches
+    assert press.last_profile["fisher_backward_mode"] == "label_sketch"
+    assert press.last_profile["fisher_sketches"] == 2
+    assert press.last_profile["fisher_label_probe_count"] == 6
+    assert press.last_profile["fisher_probe_count"] == 4
+
+
+def test_all_label_sketch_prefill_uses_full_vocabulary_without_extra_backwards():
+    torch.manual_seed(15)
+    config = LlamaConfig(
+        vocab_size=41,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=64,
+    )
+    model = LlamaForCausalLM(config).eval()
+    press = LogitKVPress(
+        SnapKVPress(compression_ratio=0.5, window_size=8, kernel_size=5),
+        fisher_window=8,
+        fisher_positions=2,
+        fisher_labels=-1,
+        fisher_backward_mode="label_sketch",
+        fisher_sketches=2,
+        fisher_seed=19,
+    )
+
+    with patch("torch.autograd.backward", wraps=torch.autograd.backward) as backward:
+        with torch.inference_mode():
+            press.prefill(
+                model,
+                torch.randint(0, config.vocab_size, (1, 32)),
+                DynamicCache(),
+            )
+
+    assert backward.call_count == 4
+    assert press.last_sampled_token_ids is None
+    assert press.last_profile["fisher_labels_per_position_used"] == config.vocab_size
+    assert press.last_profile["fisherlabel_samplemode_effective"] == "all"
+    assert press.last_profile["fisher_label_probe_count"] == 2 * config.vocab_size
+    assert press.last_profile["fisher_probe_count"] == 4
 
 
 def test_128_token_prefill_and_compressed_cache_decode_on_cpu():
